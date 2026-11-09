@@ -5,6 +5,10 @@
 //! one navigable list in a single window. Albums (CBZ/CBR/ZIP/RAR/EPUB/PDF)
 //! expand into their pages automatically.
 
+// Don't spawn a console window in release builds on Windows (debug builds
+// keep it so stderr logging is visible during development).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod archive;
 mod decode;
