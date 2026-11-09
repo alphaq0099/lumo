@@ -1031,14 +1031,25 @@ impl Lumo {
                 ui.painter()
                     .image(texture.id(), rect, uv, Color32::WHITE);
 
-                // ---- wheel zoom (anchored)
+                // ---- wheel zoom (raw events, proportional & consistent)
                 if resp.hovered() {
-                    let (scroll, pointer) = ctx.input(|i| {
-                        (i.smooth_scroll_delta, i.pointer.hover_pos())
+                    // Sum the raw wheel events of this frame, normalized to lines.
+                    // (egui's smooth_scroll_delta keeps decaying for several
+                    // frames after the wheel stops, which made zoom erratic.)
+                    let wheel_lines = ctx.input(|i| {
+                        i.raw.events.iter().filter_map(|e| match e {
+                            egui::Event::MouseWheel { unit, delta, .. } => Some(match unit {
+                                egui::MouseWheelUnit::Line => delta.y,
+                                egui::MouseWheelUnit::Point => delta.y / 16.0,
+                                egui::MouseWheelUnit::Page => delta.y * 16.0,
+                            }),
+                            _ => None,
+                        })
+                        .sum::<f32>()
                     });
-                    if scroll.y.abs() > 0.5 {
-                        if let Some(p) = pointer {
-                            self.zoom_anchor(&ctx, scroll.y, p);
+                    if wheel_lines.abs() > 0.01 {
+                        if let Some(p) = ctx.input(|i| i.pointer.hover_pos()) {
+                            self.zoom_wheel(&ctx, wheel_lines, p);
                         }
                     }
                 }
@@ -1058,6 +1069,13 @@ impl Lumo {
                     self.pan = Vec2::ZERO;
                 }
 
+                // ---- edge hover arrows (appear at the window ends only
+                //      when there is a previous/next page and the cursor
+                //      is near that end)
+                if !self.crop_mode {
+                    self.edge_arrows(ui, &ctx, avail, &resp);
+                }
+
                 // ---- crop
                 if self.crop_mode {
                     self.crop_ui(ui, &ctx, rect, &resp, img_size);
@@ -1070,17 +1088,112 @@ impl Lumo {
         }
     }
 
-    fn zoom_anchor(&mut self, ctx: &egui::Context, scroll_y: f32, pointer: Pos2) {
-        let avail = self.last_avail;
-        let fit = self.fit_scale(avail.size(), ctx);
-        let old = match self.zoom {
-            Zoom::Fit => fit,
-            Zoom::Scale(s) => s,
-        };
-        if old < 0.001 {
+    /// Wheel zoom: one ratio per distance traveled, identical for mouse
+    /// notches (Line unit) and trackpad pixels (Point unit). Anchored at
+    /// the cursor.
+    /// Big translucent ◀ / ▶ arrows at the window edges. Visible only while
+    /// the cursor hovers the edge strip, and only when a previous/next page
+    /// exists in the selection.
+    fn edge_arrows(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        avail: Rect,
+        img_resp: &egui::Response,
+    ) {
+        let zone_w = 72.0f32.min(avail.width() * 0.4);
+        if zone_w < 8.0 {
             return;
         }
-        let factor = if scroll_y > 0.0 { 1.15 } else { 1.0 / 1.15 };
+        let left_zone = Rect::from_min_size(avail.min, Vec2::new(zone_w, avail.height()));
+        let right_zone = Rect::from_min_max(
+            Pos2::new(avail.max.x - zone_w, avail.min.y),
+            avail.max,
+        );
+
+        let has_prev = self.selection_has_prev();
+        let has_next = self.selection_has_next();
+        if !has_prev && !has_next {
+            return;
+        }
+
+        let pointer = ctx.input(|i| i.pointer.hover_pos());
+
+        // Interaction first (on top of the pan/crop area), then painting.
+        if has_prev {
+            let resp = ui.interact(left_zone, egui::Id::unique("lumo-edge-left"), egui::Sense::click());
+            if resp.clicked() {
+                self.do_action(ctx, Action::Prev);
+            }
+        }
+        if has_next {
+            let resp = ui.interact(right_zone, egui::Id::unique("lumo-edge-right"), egui::Sense::click());
+            if resp.clicked() {
+                self.do_action(ctx, Action::Next);
+            }
+        }
+
+        let p = &ui.painter();
+        let dim = Color32::from_rgba_unmultiplied(30, 30, 30, 110);
+        let chev = Color32::from_rgba_unmultiplied(235, 235, 235, 200);
+        let font = egui::FontId::proportional(46.0);
+        let mid_y = avail.center().y;
+        let _ = img_resp;
+
+        let Some(pp) = pointer else { return };
+
+        // Draw only the strip the cursor is actually hovering, and only if
+        // that side has something to navigate to.
+        if has_prev && left_zone.contains(pp) {
+            p.rect_filled(left_zone, 0.0, dim);
+            p.text(
+                Pos2::new(avail.min.x + zone_w * 0.5, mid_y),
+                Align2::CENTER_CENTER,
+                "◀",
+                font.clone(),
+                chev,
+            );
+        }
+        if has_next && right_zone.contains(pp) {
+            p.rect_filled(right_zone, 0.0, dim);
+            p.text(
+                Pos2::new(avail.max.x - zone_w * 0.5, mid_y),
+                Align2::CENTER_CENTER,
+                "▶",
+                font,
+                chev,
+            );
+        }
+    }
+
+    /// Is there a page before the current one anywhere in the selection?
+    fn selection_has_prev(&self) -> bool {
+        self.cur_doc > 0 || self.cur_page > 0
+    }
+
+    /// Is there a page after the current one anywhere in the selection?
+    fn selection_has_next(&self) -> bool {
+        let more_pages = self.cur_page + 1 < self.pages();
+        let more_docs = self.cur_doc + 1 < self.docs.len();
+        more_pages || more_docs
+    }
+
+    fn zoom_wheel(&mut self, ctx: &egui::Context, wheel_lines: f32, pointer: Pos2) {        let avail = self.last_avail;
+        if avail.is_negative() {
+            return;
+        }
+        let fit = self.fit_scale(avail.size(), ctx);
+        let old = match self.zoom {
+            Zoom::Fit => {
+                if wheel_lines <= 0.0 {
+                    return; // can't zoom out from fit
+                }
+                fit
+            }
+            Zoom::Scale(s) => s,
+        };
+        // positive wheel = zoom in; ~13% per wheel notch.
+        let factor = (wheel_lines * 0.12).exp().clamp(0.80, 1.30);
         let new = (old * factor).clamp(0.02, 40.0);
         if new <= fit * 1.02 {
             self.zoom = Zoom::Fit;
@@ -1088,6 +1201,7 @@ impl Lumo {
             return;
         }
         self.zoom = Zoom::Scale(new);
+        // Keep the point under the cursor stable in image space.
         let origin = self.view_origin(avail, ctx);
         let delta = pointer - origin;
         let ratio = new / old;
