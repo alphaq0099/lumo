@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=lumo
+GenericName=Image Viewer
+Comment=Fast, light viewer for images, comics (CBZ/CBR) and PDFs
+Exec=lumo %U
+TryExec=lumo
+Icon=image-viewer
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=image/png;image/jpeg;image/gif;image/webp;image/bmp;image/tiff;image/x-tga;
+ image/vnd.microsoft.icon;image/x-ico;image/x-portable-anymap;image/x-portable-pixmap;
+ image/x-portable-graymap;image/x-portable-bitmap;image/qoi;image/x-dds;image/avif;
+ image/jxl;image/svg+xml;application/x-cbz;application/x-cbr;application/vnd.comicbook+zip;
+ application/vnd.comicbook-rar;application/zip;application/epub+zip;application/pdf;
+StartupNotify=true
+StartupWMClass=lumo

@@ -1,0 +1,14 @@
+Windows Registry Editor Version 5.00
+
+; Right-click → "Open with lumo"
+; Receives ENTIRE multi-selection (MultiSelectModel="Player").
+;
+; EDIT THE PATH below to where lumo.exe lives, then double-click this file.
+
+[HKEY_CLASSES_ROOT\*\shell\Open with lumo]
+"MUIVerb"="Open with lumo"
+"Icon"="C:\\Tools\\lumo\\lumo.exe"
+"MultiSelectModel"="Player"
+
+[HKEY_CLASSES_ROOT\*\shell\Open with lumo\command]
+@="\"C:\\Tools\\lumo\\lumo.exe\" \"%1\""
