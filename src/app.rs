@@ -15,6 +15,17 @@ use std::time::Instant;
 
 type Tex = egui::TextureHandle;
 
+/// In-flight wheel-zoom animation: scale/pan blend from the old value to the
+/// current target (`self.zoom` / `self.pan`).
+#[derive(Clone, Copy, Debug)]
+struct ZoomAnim {
+    from_scale: f32,
+    from_pan: Vec2,
+    t: f32,
+}
+
+const ZOOM_ANIM_SPEED: f32 = 16.0; // ~0.19 s to settle
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Zoom {
     Fit,
@@ -63,6 +74,8 @@ pub struct Lumo {
 
     zoom: Zoom,
     pan: Vec2,
+    zoom_anim: Option<ZoomAnim>,
+    wheel_zoom_pct: f32, // how much one wheel notch zooms, in %
     last_avail: Rect,
     fullscreen: bool,
 
@@ -102,6 +115,8 @@ impl Lumo {
             adjust: Adjust::default(),
             zoom: Zoom::Fit,
             pan: Vec2::ZERO,
+            zoom_anim: None,
+            wheel_zoom_pct: Self::load_wheel_zoom_pct(),
             last_avail: Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0)),
             fullscreen: false,
             panel_open: false,
@@ -137,10 +152,96 @@ impl Lumo {
     fn reset_view(&mut self) {
         self.zoom = Zoom::Fit;
         self.pan = Vec2::ZERO;
+        self.zoom_anim = None;
         self.crop_mode = false;
         self.crop_start = None;
         self.crop_rect = None;
         self.adjust = Adjust::default();
+    }
+
+    // ------------------------------------------------------- smooth zoom
+
+    /// Advance the wheel-zoom animation one frame and returns nothing;
+    /// the displayed values are read through `zoom_display`.
+    fn zoom_tick(&mut self, ctx: &egui::Context) {
+        if let Some(a) = self.zoom_anim.as_mut() {
+            let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.05);
+            a.t += dt * ZOOM_ANIM_SPEED;
+            if a.t >= 1.0 {
+                self.zoom_anim = None;
+            }
+        }
+    }
+
+    /// Displayed (scale, pan), blending the animation if one is running.
+    fn zoom_display(&self, fit: f32) -> (f32, Vec2) {
+        let (ts, tp) = match self.zoom {
+            Zoom::Fit => (fit, Vec2::ZERO),
+            Zoom::Scale(s) => (s, self.pan),
+        };
+        let Some(a) = self.zoom_anim else {
+            return (ts, tp);
+        };
+        // ease-out cubic for a natural settle
+        let t = 1.0 - (1.0 - a.t).powi(3);
+        (a.from_scale + (ts - a.from_scale) * t, a.from_pan + (tp - a.from_pan) * t)
+    }
+
+    /// Start a new animation from wherever we are displayed right now.
+    fn zoom_anim_start(&mut self, fit: f32) {
+        let (s, p) = self.zoom_display(fit);
+        self.zoom_anim = Some(ZoomAnim { from_scale: s, from_pan: p, t: 0.0 });
+    }
+
+    // ------------------------------------------------------- settings
+
+    fn config_path() -> Option<std::path::PathBuf> {
+        if let Some(v) = std::env::var_os("LUMO_CONFIG") {
+            if !v.is_empty() {
+                return Some(std::path::PathBuf::from(v));
+            }
+        }
+        if cfg!(windows) {
+            let appdata = std::env::var_os("APPDATA")?;
+            return Some(
+                std::path::PathBuf::from(appdata).join("lumo").join("lumo.conf"),
+            );
+        }
+        let dir = match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(v) if !v.is_empty() => std::path::PathBuf::from(v),
+            _ => match std::env::var_os("HOME") {
+                Some(h) => std::path::PathBuf::from(h).join(".config"),
+                None => return None,
+            },
+        };
+        Some(std::path::PathBuf::from(dir).join("lumo").join("lumo.conf"))
+    }
+
+    fn load_wheel_zoom_pct() -> f32 {
+        let Some(path) = Self::config_path() else { return 13.0 };
+        match std::fs::read_to_string(&path) {
+            Ok(txt) => {
+                for line in txt.lines() {
+                    if let Some(v) = line.strip_prefix("wheel_zoom_pct") {
+                        let v = v.trim().trim_start_matches('=').trim();
+                        if let Ok(p) = v.parse::<f32>() {
+                            return p.clamp(1.0, 80.0);
+                        }
+                    }
+                }
+                13.0
+            }
+            Err(_) => 13.0,
+        }
+    }
+
+    fn save_settings(&self) {
+        let Some(path) = Self::config_path() else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let txt = format!("wheel_zoom_pct = {:.1}\n", self.wheel_zoom_pct.round());
+        let _ = std::fs::write(&path, txt);
     }
 
     fn next_page(&mut self) {
@@ -637,6 +738,7 @@ impl Lumo {
         if s <= fit * 1.02 {
             self.zoom = Zoom::Fit;
             self.pan = Vec2::ZERO;
+            self.zoom_anim = None;
             return;
         }
         self.zoom = Zoom::Scale(s);
@@ -648,6 +750,7 @@ impl Lumo {
         // compensate via pan.
         let ratio = s / new_scale;
         self.pan += delta - delta * ratio;
+        self.zoom_anim = None;
     }
 
     fn fit_scale(&self, avail: Vec2, ctx: &egui::Context) -> f32 {        let Some(tex) = self.best_texture_size(ctx) else {
@@ -769,6 +872,21 @@ impl Lumo {
                 }
                 if ui.add(egui::Button::new("100% (1)")).clicked() {
                     self.do_action(ui.ctx(), Action::Zoom100);
+                }
+                ui.separator();
+                ui.label(egui::RichText::new("wheel").weak().size(11.0));
+                let zr = ui.add(
+                    egui::DragValue::new(&mut self.wheel_zoom_pct)
+                        .speed(0.5)
+                        .range(1.0..=80.0)
+                        .suffix("%"),
+                )
+                .on_hover_text(
+                    "How much one scroll-wheel notch zooms in/out. \
+                     Click and drag sideways to change.",
+                );
+                if zr.changed() {
+                    self.save_settings();
                 }
                 ui.separator();
                 if ui.add(egui::Button::new("Open…")).clicked() {
@@ -1004,27 +1122,28 @@ impl Lumo {
                     .best_texture_size(&ctx)
                     .unwrap_or_else(|| Vec2::splat(1.0));
                 let fit = self.fit_scale(avail.size(), &ctx);
-                let scale = match self.zoom {
-                    Zoom::Fit => fit,
-                    Zoom::Scale(s) => s,
-                };
+                // Advance the smooth-zoom animation, then use displayed values.
+                self.zoom_tick(&ctx);
+                let (scale, mut pan) = self.zoom_display(fit);
 
                 // Clamp pan so the image doesn't wander off.
                 let size = Vec2::new(img_size.x * scale, img_size.y * scale);
-                if size.x <= avail.width() {
-                    self.pan.x = 0.0;
-                } else {
-                    self.pan.x = self.pan.x.clamp(avail.width() - size.x, 0.0);
-                }
-                if size.y <= avail.height() {
-                    self.pan.y = 0.0;
-                } else {
-                    self.pan.y = self.pan.y.clamp(avail.height() - size.y, 0.0);
+                let clamp_axis = |p: f32, avail_v: f32, size_v: f32| -> f32 {
+                    if size_v <= avail_v {
+                        0.0
+                    } else {
+                        p.clamp(avail_v - size_v, 0.0)
+                    }
+                };
+                pan.x = clamp_axis(pan.x, avail.width(), size.x);
+                pan.y = clamp_axis(pan.y, avail.height(), size.y);
+                if self.zoom_anim.is_none() {
+                    self.pan = pan;
                 }
                 let origin = if size.x <= avail.width() && size.y <= avail.height() {
                     avail.min + (avail.size() - size) / 2.0
                 } else {
-                    avail.min + self.pan
+                    avail.min + pan
                 };
                 let rect = Rect::from_min_size(origin, size);
                 let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
@@ -1057,6 +1176,7 @@ impl Lumo {
                 // ---- drag pan
                 if resp.dragged() && !self.crop_mode {
                     self.pan -= resp.drag_delta();
+                    self.zoom_anim = None;
                 }
 
                 // ---- double click: fit ↔ 100%
@@ -1067,13 +1187,14 @@ impl Lumo {
                         Zoom::Scale(1.0)
                     };
                     self.pan = Vec2::ZERO;
+                    self.zoom_anim = None;
                 }
 
                 // ---- edge hover arrows (appear at the window ends only
                 //      when there is a previous/next page and the cursor
                 //      is near that end)
                 if !self.crop_mode {
-                    self.edge_arrows(ui, &ctx, avail, &resp);
+                    self.edge_arrows(ui, &ctx, avail);
                 }
 
                 // ---- crop
@@ -1088,20 +1209,13 @@ impl Lumo {
         }
     }
 
-    /// Wheel zoom: one ratio per distance traveled, identical for mouse
-    /// notches (Line unit) and trackpad pixels (Point unit). Anchored at
-    /// the cursor.
-    /// Big translucent ◀ / ▶ arrows at the window edges. Visible only while
-    /// the cursor hovers the edge strip, and only when a previous/next page
-    /// exists in the selection.
-    fn edge_arrows(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        avail: Rect,
-        img_resp: &egui::Response,
-    ) {
-        let zone_w = 72.0f32.min(avail.width() * 0.4);
+    /// Big soft-edge chevron arrows at the window ends: a gentle gradient
+    /// strip that fades out toward the image, an angular chevron in the
+    /// flaticon "right arrow" style, and a quick fade + slide animation
+    /// when it appears on hover. Only drawn while the cursor hovers the
+    /// strip, and only when a previous/next page exists in the selection.
+    fn edge_arrows(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, avail: Rect) {
+        let zone_w = 88.0f32.min(avail.width() * 0.4);
         if zone_w < 8.0 {
             return;
         }
@@ -1133,36 +1247,68 @@ impl Lumo {
             }
         }
 
-        let p = &ui.painter();
-        let dim = Color32::from_rgba_unmultiplied(30, 30, 30, 110);
-        let chev = Color32::from_rgba_unmultiplied(235, 235, 235, 200);
-        let font = egui::FontId::proportional(46.0);
-        let mid_y = avail.center().y;
-        let _ = img_resp;
-
         let Some(pp) = pointer else { return };
 
-        // Draw only the strip the cursor is actually hovering, and only if
-        // that side has something to navigate to.
-        if has_prev && left_zone.contains(pp) {
-            p.rect_filled(left_zone, 0.0, dim);
-            p.text(
-                Pos2::new(avail.min.x + zone_w * 0.5, mid_y),
-                Align2::CENTER_CENTER,
-                "◀",
-                font.clone(),
-                chev,
+        // Chevron geometry: three joints of an angular ">" arrow.
+        let size = zone_w * 0.62;
+        const CHEVRON: &[(f32, f32)] = &[(-0.34, -0.40), (0.34, 0.0), (-0.34, 0.40)];
+
+        let mid_y = avail.center().y;
+
+        for (left, zone, has) in [
+            (true, left_zone, has_prev),
+            (false, right_zone, has_next),
+        ] {
+            if !has || !zone.contains(pp) {
+                continue;
+            }
+            // fade + slide-in over 0.15 s (egui keeps repainting while animating)
+            let t = ctx.animate_value_with_time(
+                egui::Id::unique(if left { "lumo-edge-left-fade" } else { "lumo-edge-right-fade" }),
+                1.0,
+                0.15,
             );
-        }
-        if has_next && right_zone.contains(pp) {
-            p.rect_filled(right_zone, 0.0, dim);
-            p.text(
-                Pos2::new(avail.max.x - zone_w * 0.5, mid_y),
-                Align2::CENTER_CENTER,
-                "▶",
-                font,
-                chev,
-            );
+            if t <= 0.01 {
+                continue;
+            }
+            let alpha = ((t * 255.0).round() as u8).clamp(0, 255);
+            let dir = if left { -1.0 } else { 1.0 };
+            let cx = zone.center().x + dir * (1.0 - t) * 12.0; // slide from the edge
+            let cyc = mid_y;
+
+            // Soft gradient: opaque-ish at the window edge, transparent toward
+            // the image.
+            let mut mesh = egui::Mesh::default();
+            let edge_c = Color32::from_black_alpha((((70.0f32) * t).round() as u8).clamp(0, 255));
+            let inner_c = Color32::from_black_alpha(0);
+            if left {
+                mesh.colored_vertex(zone.min, edge_c);
+                mesh.colored_vertex(Pos2::new(zone.min.x, zone.max.y), edge_c);
+                let (it, ib) = (Pos2::new(zone.max.x, zone.min.y), Pos2::new(zone.max.x, zone.max.y));
+                mesh.colored_vertex(it, inner_c);
+                mesh.colored_vertex(ib, inner_c);
+            } else {
+                mesh.colored_vertex(zone.max, edge_c);
+                mesh.colored_vertex(Pos2::new(zone.max.x, zone.min.y), edge_c);
+                let (it, ib) = (Pos2::new(zone.min.x, zone.min.y), Pos2::new(zone.min.x, zone.max.y));
+                mesh.colored_vertex(it, inner_c);
+                mesh.colored_vertex(ib, inner_c);
+            }
+            mesh.add_triangle(0, 1, 2);
+            mesh.add_triangle(2, 1, 3);
+            ui.painter().add(egui::Shape::mesh(mesh));
+
+            // Angular chevron (flaticon right-arrow style) with round joints.
+            let stroke_w = size * 0.15;
+            let stroke = egui::Stroke::new(stroke_w, Color32::from_white_alpha(alpha));
+            let pts: Vec<Pos2> = CHEVRON
+                .iter()
+                .map(|(dx, dy)| Pos2::new(cx + dir * dx * size, cyc + dy * size))
+                .collect();
+            ui.painter().add(egui::Shape::line(pts.clone(), stroke));
+            for p in pts {
+                ui.painter().add(egui::Shape::circle_filled(p, stroke_w * 0.5, stroke.color));
+            }
         }
     }
 
@@ -1178,12 +1324,16 @@ impl Lumo {
         more_pages || more_docs
     }
 
-    fn zoom_wheel(&mut self, ctx: &egui::Context, wheel_lines: f32, pointer: Pos2) {        let avail = self.last_avail;
+    /// Wheel zoom: one ratio per wheel distance traveled, identical for mouse
+    /// notches (Line unit) and trackpad pixels (Point unit). Percent per notch
+    /// is user-configurable. Anchored at the cursor and animated smoothly.
+    fn zoom_wheel(&mut self, ctx: &egui::Context, wheel_lines: f32, pointer: Pos2) {
+        let avail = self.last_avail;
         if avail.is_negative() {
             return;
         }
         let fit = self.fit_scale(avail.size(), ctx);
-        let old = match self.zoom {
+        let old_scale = match self.zoom {
             Zoom::Fit => {
                 if wheel_lines <= 0.0 {
                     return; // can't zoom out from fit
@@ -1192,19 +1342,26 @@ impl Lumo {
             }
             Zoom::Scale(s) => s,
         };
-        // positive wheel = zoom in; ~13% per wheel notch.
-        let factor = (wheel_lines * 0.12).exp().clamp(0.80, 1.30);
-        let new = (old * factor).clamp(0.02, 40.0);
+        // positive wheel = zoom in; `wheel_zoom_pct`% per notch.
+        let pct = self.wheel_zoom_pct.clamp(1.0, 80.0);
+        let factor = (wheel_lines * (pct / 100.0).ln()).exp().clamp(0.80, 1.30);
+        let new = (old_scale * factor).clamp(0.02, 40.0);
+
+        // Anchor point is always computed from the *target* values below.
+        let origin = self.view_origin(avail, ctx);
+        let delta = pointer - origin;
+
+        // animate from wherever we are displayed right now
+        self.zoom_anim_start(fit);
+
         if new <= fit * 1.02 {
             self.zoom = Zoom::Fit;
             self.pan = Vec2::ZERO;
             return;
         }
         self.zoom = Zoom::Scale(new);
-        // Keep the point under the cursor stable in image space.
-        let origin = self.view_origin(avail, ctx);
-        let delta = pointer - origin;
-        let ratio = new / old;
+        // Keep the point under the cursor stable in image space (target pan).
+        let ratio = new / old_scale;
         self.pan += delta - delta * ratio;
     }
 
