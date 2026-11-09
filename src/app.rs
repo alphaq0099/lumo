@@ -1036,6 +1036,22 @@ impl Lumo {
                         .family(egui::FontFamily::Proportional),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // current zoom, right before the transient messages
+                    let fit = self.fit_scale(self.last_avail.size(), ui.ctx());
+                    let (scale, _) = self.zoom_display(fit);
+                    let ztxt = match self.zoom {
+                        Zoom::Fit => "fit".to_string(),
+                        Zoom::Scale(_) => format!("{:.0}%", (scale * 100.0).round()),
+                    };
+                    ui.label(
+                        egui::RichText::new(ztxt)
+                            .weak()
+                            .monospace(),
+                    )
+                    .on_hover_text(format!(
+                        "current zoom · each wheel notch steps {:.0}%",
+                        self.wheel_zoom_pct.clamp(1.0, 80.0).round()
+                    ));
                     // Lazy mutable state cleanup
                     if let Some((m, t)) = self.flash.clone() {
                         if t.elapsed().as_secs_f32() < 3.0 {
@@ -1150,8 +1166,15 @@ impl Lumo {
                 ui.painter()
                     .image(texture.id(), rect, uv, Color32::WHITE);
 
-                // ---- wheel zoom (raw events, proportional & consistent)
-                if resp.hovered() {
+                // ---- wheel zoom (raw events, proportional & consistent).
+                // Gate on the pointer being over the image rect, NOT on
+                // `resp.hovered()`: on Windows the later-registered edge-arrow
+                // click zones can invalidate the response hover, which made
+                // the wheel dead.
+                let over_img = ctx
+                    .input(|i| i.pointer.hover_pos())
+                    .is_some_and(|p| avail.contains(p));
+                if over_img {
                     // Sum the raw wheel events of this frame, normalized to lines.
                     // (egui's smooth_scroll_delta keeps decaying for several
                     // frames after the wheel stops, which made zoom erratic.)
@@ -1259,13 +1282,16 @@ impl Lumo {
             (true, left_zone, has_prev),
             (false, right_zone, has_next),
         ] {
-            if !has || !zone.contains(pp) {
+            if !has {
                 continue;
             }
-            // fade + slide-in over 0.15 s (egui keeps repainting while animating)
+            // Animate to 1 while hovered and back to 0 when the cursor
+            // leaves — painting continues during the fade-out, which keeps
+            // the strip from snapping or leaving artifacts behind.
+            let hovered = zone.contains(pp);
             let t = ctx.animate_value_with_time(
                 egui::Id::unique(if left { "lumo-edge-left-fade" } else { "lumo-edge-right-fade" }),
-                1.0,
+                if hovered { 1.0 } else { 0.0 },
                 0.15,
             );
             if t <= 0.01 {
@@ -1298,9 +1324,14 @@ impl Lumo {
             mesh.add_triangle(2, 1, 3);
             ui.painter().add(egui::Shape::mesh(mesh));
 
-            // Angular chevron (flaticon right-arrow style) with round joints.
+            // Angular chevron (flaticon right-arrow style) with round joints,
+            // in a light gray so it doesn't glare on bright images.
+            let gray = Color32::from_rgba_unmultiplied(205, 205, 205, 255);
             let stroke_w = size * 0.15;
-            let stroke = egui::Stroke::new(stroke_w, Color32::from_white_alpha(alpha));
+            let stroke = egui::Stroke::new(
+                stroke_w,
+                Color32::from_rgba_unmultiplied(gray.r(), gray.g(), gray.b(), alpha),
+            );
             let pts: Vec<Pos2> = CHEVRON
                 .iter()
                 .map(|(dx, dy)| Pos2::new(cx + dir * dx * size, cyc + dy * size))
@@ -1344,7 +1375,7 @@ impl Lumo {
         };
         // positive wheel = zoom in; `wheel_zoom_pct`% per notch.
         let pct = self.wheel_zoom_pct.clamp(1.0, 80.0);
-        let factor = (wheel_lines * (pct / 100.0).ln()).exp().clamp(0.80, 1.30);
+        let factor = (wheel_lines * (1.0 + pct / 100.0).ln()).exp().clamp(0.80, 1.30);
         let new = (old_scale * factor).clamp(0.02, 40.0);
 
         // Anchor point is always computed from the *target* values below.
