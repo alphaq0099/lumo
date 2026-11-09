@@ -1302,26 +1302,33 @@ impl Lumo {
             let cx = zone.center().x + dir * (1.0 - t) * 12.0; // slide from the edge
             let cyc = mid_y;
 
-            // Soft gradient: opaque-ish at the window edge, transparent toward
-            // the image.
+            // Soft gradient: dark at the window edge, fading to transparent
+            // toward the image. Built from thin per-column strips instead of
+            // one big quad — a two-triangle gradient showed hard diagonal
+            // seams on some Windows GL drivers, while per-column strips
+            // render identically everywhere.
             let mut mesh = egui::Mesh::default();
-            let edge_c = Color32::from_black_alpha((((70.0f32) * t).round() as u8).clamp(0, 255));
-            let inner_c = Color32::from_black_alpha(0);
-            if left {
-                mesh.colored_vertex(zone.min, edge_c);
-                mesh.colored_vertex(Pos2::new(zone.min.x, zone.max.y), edge_c);
-                let (it, ib) = (Pos2::new(zone.max.x, zone.min.y), Pos2::new(zone.max.x, zone.max.y));
-                mesh.colored_vertex(it, inner_c);
-                mesh.colored_vertex(ib, inner_c);
-            } else {
-                mesh.colored_vertex(zone.max, edge_c);
-                mesh.colored_vertex(Pos2::new(zone.max.x, zone.min.y), edge_c);
-                let (it, ib) = (Pos2::new(zone.min.x, zone.min.y), Pos2::new(zone.min.x, zone.max.y));
-                mesh.colored_vertex(it, inner_c);
-                mesh.colored_vertex(ib, inner_c);
+            let bands = ((zone_w * 0.6).ceil() as usize).max(8);
+            let step = zone_w / bands as f32;
+            let max_a = ((70.0f32 * t).round()).clamp(0.0, 90.0);
+            let mut prev_col: Option<u32> = None;
+            for i in 0..=bands {
+                let a = (max_a * (1.0 - i as f32 / bands as f32)).round() as u8;
+                let c = Color32::from_black_alpha(a);
+                let x = if left {
+                    zone.min.x + i as f32 * step
+                } else {
+                    zone.max.x - i as f32 * step
+                };
+                let v = mesh.vertices.len() as u32;
+                mesh.colored_vertex(Pos2::new(x, zone.min.y), c);
+                mesh.colored_vertex(Pos2::new(x, zone.max.y), c);
+                if let Some(p) = prev_col {
+                    mesh.add_triangle(p, p + 1, v);
+                    mesh.add_triangle(v, p + 1, v + 1);
+                }
+                prev_col = Some(v);
             }
-            mesh.add_triangle(0, 1, 2);
-            mesh.add_triangle(2, 1, 3);
             ui.painter().add(egui::Shape::mesh(mesh));
 
             // Angular chevron (flaticon right-arrow style) with round joints,
