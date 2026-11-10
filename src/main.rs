@@ -14,6 +14,7 @@ mod archive;
 mod decode;
 mod doc;
 mod edit;
+mod icons;
 mod pdf;
 mod save;
 

@@ -4,6 +4,7 @@
 use crate::decode::{self, PageKey};
 use crate::doc::{self, Document};
 use crate::edit::{self, EditOp};
+use crate::icons;
 use crate::save::Adjust;
 use egui::{
     Align2, Area, CentralPanel, Color32, ColorImage, Frame, Key, Panel, Pos2, Rect, Vec2,
@@ -718,6 +719,9 @@ impl Lumo {
                 self.fullscreen = !self.fullscreen;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
             }
+            Action::Exit => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
     }
 
@@ -843,105 +847,226 @@ impl Lumo {
 
     // ------------------------------------------------------- panels
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        Panel::top("lumo-toolbar").show(ui, |ui| {
-            ui.add_space(4.0);
+    /// Proper top bar: menu row (File / View / Edit / ⚙) over a slim row of
+    /// vector-icon buttons for frequent actions; file info in the center.
+    fn topbar(&mut self, ui: &mut egui::Ui) {
+        Panel::top("lumo-topbar").show(ui, |ui| {
+            ui.add_space(2.0);
+
+            // ---- row 1: menu bar + centered file info + settings on the right
+            let row = ui.horizontal(|ui| {
+                let ctx = ui.ctx().clone();
+                let mut act = |ui: &mut egui::Ui, a: Action| {
+                    if ui.button(Self::menu_label(a)).clicked() {
+                        self.do_action(&ctx, a);
+                    }
+                };
+
+                ui.menu_button("File", |ui| {
+                    act(ui, Action::Open);
+                    act(ui, Action::Save);
+                    act(ui, Action::SaveAs);
+                    act(ui, Action::Copy);
+                    ui.separator();
+                    act(ui, Action::Exit);
+                });
+                ui.menu_button("View", |ui| {
+                    act(ui, Action::Fit);
+                    act(ui, Action::Zoom100);
+                    act(ui, Action::Panel);
+                    ui.separator();
+                    act(ui, Action::Fullscreen);
+                });
+                ui.menu_button("Edit", |ui| {
+                    act(ui, Action::RotateL);
+                    act(ui, Action::RotateR);
+                    act(ui, Action::FlipH);
+                    act(ui, Action::FlipV);
+                    ui.separator();
+                    act(ui, Action::Crop);
+                    act(ui, Action::Grayscale);
+                    act(ui, Action::Sharpen);
+                    ui.separator();
+                    act(ui, Action::Undo);
+                });
+
+            let info_left = ui.cursor().min.x;
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button("⚙", |ui| {
+                        ui.label(
+                            egui::RichText::new("Wheel zoom per notch")
+                                .weak()
+                                .size(12.0),
+                        );
+                        let zr = ui.add(
+                            egui::DragValue::new(&mut self.wheel_zoom_pct)
+                                .speed(0.5)
+                                .range(1.0..=80.0)
+                                .suffix("%"),
+                        )
+                        .on_hover_text(
+                            "How much one scroll-wheel notch zooms in/out. Drag sideways to change.",
+                        );
+                        if zr.changed() {
+                            self.save_settings();
+                        }
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "lumo v{} — image viewer & comic reader",
+                                env!("CARGO_PKG_VERSION")
+                            ))
+                            .weak()
+                            .size(12.0),
+                        );
+                    });
+                });
+
+                info_left
+            });
+            let row_rect = row.response.rect;
+            let info_left = row.inner;
+
+            // centered file label, drawn directly so it survives narrow windows
+            let info = self.file_info_text();
+            if !info.is_empty() {
+                let weak = Color32::from_rgba_unmultiplied(185, 185, 185, 255);
+                let info_right = row_rect.max.x - 48.0;
+                if info_right > info_left {
+                    let c = Pos2::new(
+                        (info_left + info_right) * 0.5,
+                        row_rect.center().y,
+                    );
+                    ui.painter().text(
+                        c,
+                        Align2::CENTER_CENTER,
+                        info,
+                        egui::FontId::proportional(13.5),
+                        weak,
+                    );
+                }
+            }
+
+            // ---- row 2: slim icon strip
+            let crop_mode = self.crop_mode;
             ui.horizontal(|ui| {
-                let prev = ui.add(egui::Button::new("◀ prev"));
-                if prev.clicked() {
-                    self.do_action(ui.ctx(), Action::Prev);
-                }
-                prev.on_hover_text("Previous page (←)");
+                ui.add_space(2.0);
+                // (icon buttons are a method on Self below — borrowing self
+                // only per call, so plain button actions can interleave)
 
-                let next = ui.add(egui::Button::new("next ▶"));
-                if next.clicked() {
-                    self.do_action(ui.ctx(), Action::Next);
-                }
-                next.on_hover_text("Next page (→ / Space)");
-
+                self.icon_btn(ui, icons::Icon::Prev, "Previous page (←)", Action::Prev);
+                self.icon_btn(ui, icons::Icon::Next, "Next page (→ / Space)", Action::Next);
                 ui.separator();
-                if ui.add(egui::Button::new("(prev file)")).clicked() {
-                    self.do_action(ui.ctx(), Action::PrevDoc);
-                }
-                if ui.add(egui::Button::new("(next file)")).clicked() {
-                    self.do_action(ui.ctx(), Action::NextDoc);
-                }
+                self.icon_btn(ui, icons::Icon::PrevFile, "Previous file (PgUp)", Action::PrevDoc);
+                self.icon_btn(ui, icons::Icon::NextFile, "Next file (PgDn)", Action::NextDoc);
                 ui.separator();
-                if ui.add(egui::Button::new("Fit (0)")).clicked() {
+                if ui
+                    .add(egui::Button::new("fit").small())
+                    .on_hover_text("Fit to window (0)")
+                    .clicked()
+                {
                     self.do_action(ui.ctx(), Action::Fit);
                 }
-                if ui.add(egui::Button::new("100% (1)")).clicked() {
+                if ui
+                    .add(egui::Button::new("1:1").small())
+                    .on_hover_text("Zoom 100% (1)")
+                    .clicked()
+                {
                     self.do_action(ui.ctx(), Action::Zoom100);
                 }
                 ui.separator();
-                ui.label(egui::RichText::new("wheel").weak().size(11.0));
-                let zr = ui.add(
-                    egui::DragValue::new(&mut self.wheel_zoom_pct)
-                        .speed(0.5)
-                        .range(1.0..=80.0)
-                        .suffix("%"),
-                )
-                .on_hover_text(
-                    "How much one scroll-wheel notch zooms in/out. \
-                     Click and drag sideways to change.",
+                self.icon_btn(ui, icons::Icon::RotateL, "Rotate left (Ctrl+L)", Action::RotateL);
+                self.icon_btn(ui, icons::Icon::RotateR, "Rotate right (Ctrl+R)", Action::RotateR);
+                self.icon_btn(
+                    ui,
+                    icons::Icon::Crop,
+                    "Crop (Ctrl+X): drag a box, Enter applies",
+                    Action::Crop,
                 );
-                if zr.changed() {
-                    self.save_settings();
-                }
-                ui.separator();
-                if ui.add(egui::Button::new("Open…")).clicked() {
-                    self.do_action(ui.ctx(), Action::Open);
-                }
-                ui.separator();
-                if ui.add(egui::Button::new("↺")).clicked() {
-                    self.do_action(ui.ctx(), Action::RotateL);
-                }
-                if ui.add(egui::Button::new("↻")).clicked() {
-                    self.do_action(ui.ctx(), Action::RotateR);
-                }
-                if ui.add(egui::Button::new("⇋ H")).clicked() {
-                    self.do_action(ui.ctx(), Action::FlipH);
-                }
-                if ui.add(egui::Button::new("⇅ V")).clicked() {
-                    self.do_action(ui.ctx(), Action::FlipV);
-                }
-                if self.crop_mode {
-                    if ui.add(egui::Button::new("✓ crop")).clicked() {
-                        self.do_action(ui.ctx(), Action::CropApply);
-                    }
-                    if ui.add(egui::Button::new("✕ cancel")).clicked() {
+                if crop_mode {
+                    self.icon_btn(ui, icons::Icon::Check, "Apply crop (Enter)", Action::CropApply);
+                    if ui
+                        .add(egui::Button::new("cancel").small())
+                        .on_hover_text("Cancel crop (Esc)")
+                        .clicked()
+                    {
                         self.do_action(ui.ctx(), Action::CropCancel);
                     }
-                } else if ui.add(egui::Button::new("Rect")).clicked() {
-                    self.do_action(ui.ctx(), Action::Crop);
-                }
-                if ui.add(egui::Button::new("B/W")).clicked() {
-                    self.do_action(ui.ctx(), Action::Grayscale);
-                }
-                if ui.add(egui::Button::new("Adjust…")).clicked() {
-                    self.do_action(ui.ctx(), Action::Panel);
                 }
                 ui.separator();
-                if ui.add(egui::Button::new("Undo (Ctrl+Z)")).clicked() {
-                    self.do_action(ui.ctx(), Action::Undo);
-                }
-                if ui.add(egui::Button::new("Save (Ctrl+S)")).clicked() {
-                    self.do_action(ui.ctx(), Action::Save);
-                }
-                if ui.add(egui::Button::new("Save As…")).clicked() {
-                    self.do_action(ui.ctx(), Action::SaveAs);
-                }
-                if ui.add(egui::Button::new("Copy (Ctrl+C)")).clicked() {
-                    self.do_action(ui.ctx(), Action::Copy);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new("🗖")).clicked() {
-                        self_do_fullscreen(self, ui.ctx());
-                    }
-                });
+                self.icon_btn(ui, icons::Icon::Undo, "Undo (Ctrl+Z)", Action::Undo);
+                self.icon_btn(ui, icons::Icon::Open, "Open files (Ctrl+O)", Action::Open);
+                self.icon_btn(ui, icons::Icon::Save, "Save (Ctrl+S)", Action::Save);
             });
-            ui.add_space(4.0);
+            ui.add_space(2.0);
         });
+    }
+
+    /// One 26-px vector-icon button in the slim actions row. Borrows `self`
+    /// only for the call, so it may be interleaved with other `self` uses.
+    fn icon_btn(&mut self, ui: &mut egui::Ui, icon: icons::Icon, tip: &str, action: Action) {
+        let size = egui::Vec2::splat(26.0);
+        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+        let fg = if resp.hovered() || resp.is_pointer_button_down_on() {
+            ui.visuals().widgets.hovered.fg_stroke.color
+        } else {
+            ui.visuals().widgets.inactive.fg_stroke.color
+        };
+        if resp.hovered() {
+            ui.painter()
+                .rect_filled(rect.expand2(egui::vec2(2.0, 1.0)), 4.0, ui.visuals().widgets.hovered.bg_fill);
+        }
+        icons::paint(ui.painter(), rect.shrink2(egui::Vec2::splat(3.5)), icon, fg);
+        let resp = resp.on_hover_text(tip);
+        if resp.clicked() {
+            self.do_action(ui.ctx(), action);
+        }
+    }
+
+    /// Menu item label: action name + its keyboard shortcut.
+    fn menu_label(action: Action) -> &'static str {
+        match action {
+            Action::Open => "Open…  (Ctrl+O)",
+            Action::Save => "Save  (Ctrl+S)",
+            Action::SaveAs => "Save As…  (Ctrl+Shift+S)",
+            Action::Copy => "Copy image  (Ctrl+C)",
+            Action::Exit => "Exit  (Alt+F4)",
+            Action::Fit => "Fit  (0)",
+            Action::Zoom100 => "100%  (1)",
+            Action::Panel => "Adjust panel  (P)",
+            Action::Fullscreen => "Fullscreen  (F11)",
+            Action::RotateL => "Rotate left  (Ctrl+L)",
+            Action::RotateR => "Rotate right  (Ctrl+R)",
+            Action::FlipH => "Flip horizontal  (Ctrl+H)",
+            Action::FlipV => "Flip vertical  (Ctrl+V)",
+            Action::Crop => "Crop  (Ctrl+X)",
+            Action::Grayscale => "Black & white",
+            Action::Sharpen => "Sharpen",
+            Action::Undo => "Undo  (Ctrl+Z)",
+            _ => "???",
+        }
+    }
+
+    /// File identity shown centered in the menu row.
+    fn file_info_text(&self) -> String {
+        match self.doc() {
+            Some(d) => {
+                let pos = format!(
+                    "{} · file {}/{} · page {}/{}",
+                    d.label,
+                    self.cur_doc + 1,
+                    self.docs.len(),
+                    self.cur_page + 1,
+                    self.pages().max(1),
+                );
+                match d.error {
+                    Some(ref e) => format!("{pos} — {e}"),
+                    None => pos,
+                }
+            }
+            None => String::new(),
+        }
     }
 
     fn edit_panel(&mut self, ui: &mut egui::Ui) {
@@ -1030,28 +1155,8 @@ impl Lumo {
                     }
                     None => "Drop files here, or press Ctrl+O to open".to_string(),
                 };
-                ui.label(
-                    egui::RichText::new(location)
-                        .weak()
-                        .family(egui::FontFamily::Proportional),
-                );
+                let _ = location;
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // current zoom, right before the transient messages
-                    let fit = self.fit_scale(self.last_avail.size(), ui.ctx());
-                    let (scale, _) = self.zoom_display(fit);
-                    let ztxt = match self.zoom {
-                        Zoom::Fit => "fit".to_string(),
-                        Zoom::Scale(_) => format!("{:.0}%", (scale * 100.0).round()),
-                    };
-                    ui.label(
-                        egui::RichText::new(ztxt)
-                            .weak()
-                            .monospace(),
-                    )
-                    .on_hover_text(format!(
-                        "current zoom · each wheel notch steps {:.0}%",
-                        self.wheel_zoom_pct.clamp(1.0, 80.0).round()
-                    ));
                     // Lazy mutable state cleanup
                     if let Some((m, t)) = self.flash.clone() {
                         if t.elapsed().as_secs_f32() < 3.0 {
@@ -1072,20 +1177,23 @@ impl Lumo {
                         Zoom::Fit => "fit".to_string(),
                         Zoom::Scale(s) => format!("{}%", (s * 100.0).round() as i32),
                     };
+                    let edits_suffix = if self.edits.contains_key(&self.key()) {
+                        format!(
+                            " · {} edits",
+                            self.edits.get(&self.key()).map(|v| v.len()).unwrap_or(0)
+                        )
+                    } else {
+                        String::new()
+                    };
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{zoom_label}{}",
-                            if self.edits.contains_key(&self.key()) {
-                                format!(
-                                    " · {} edits",
-                                    self.edits.get(&self.key()).map(|v| v.len()).unwrap_or(0)
-                                )
-                            } else {
-                                String::new()
-                            }
-                        ))
-                        .weak(),
-                    );
+                        egui::RichText::new(format!("{zoom_label}{edits_suffix}"))
+                            .weak()
+                            .monospace(),
+                    )
+                    .on_hover_text(format!(
+                        "current zoom · each wheel notch steps {:.0}%",
+                        self.wheel_zoom_pct.clamp(1.0, 80.0).round()
+                    ));
                 });
             });
 
@@ -1485,10 +1593,6 @@ impl Lumo {
     }
 }
 
-fn self_do_fullscreen(app: &mut Lumo, ctx: &egui::Context) {
-    app.do_action(ctx, Action::Fullscreen);
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Action {
     Next,
@@ -1517,6 +1621,7 @@ enum Action {
     CropCancel,
     Panel,
     Fullscreen,
+    Exit,
 }
 
 impl eframe::App for Lumo {
@@ -1538,7 +1643,7 @@ impl eframe::App for Lumo {
         self.incoming_files(&ctx);
         self.handle_input(&ctx);
 
-        self.toolbar(ui);
+        self.topbar(ui);
         self.edit_panel(ui);
         self.status(ui);
 
