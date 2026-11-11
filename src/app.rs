@@ -40,7 +40,10 @@ struct Entry {
     edited: Option<(String, Arc<image::DynamicImage>)>,
     texture: Option<Tex>,
     tex_sig: Option<String>,
-    approx_bytes: usize,
+    /// Decoded pixel dimensions, for memory accounting.
+    dims: Option<(u32, u32)>,
+    /// Where the pixels came from, so a dropped `original` can be re-decoded.
+    source: Option<doc::PageSource>,
 }
 
 impl Entry {
@@ -51,12 +54,24 @@ impl Entry {
             edited: None,
             texture: None,
             tex_sig: None,
-            approx_bytes: 0,
+            dims: None,
+            source: None,
         }
+    }
+
+    /// Rough resident cost: the decoded pixels plus the GPU texture copy.
+    fn approx_bytes(&self) -> usize {
+        let Some((w, h)) = self.dims else {
+            return 0;
+        };
+        let px = (w as usize) * (h as usize) * 4;
+        px + if self.texture.is_some() { px } else { 0 } + 64
     }
 }
 
-const MAX_CACHE_BYTES: usize = 512 * 1024 * 1024;
+/// Soft ceiling for the decoded-page cache. Pages are cheap to re-decode from
+/// local files, so evict rather than grow without bound.
+const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 pub struct Lumo {
     docs: Vec<Document>,
@@ -87,6 +102,8 @@ pub struct Lumo {
 
     toast: Option<(String, Instant)>,
     flash: Option<(String, Instant)>,
+    /// Window has been fitted to the monitor at least once.
+    mon_clamped: bool,
 }
 
 enum Prepared {
@@ -126,6 +143,7 @@ impl Lumo {
             crop_rect: None,
             toast: None,
             flash: None,
+            mon_clamped: false,
         }
     }
 
@@ -371,42 +389,135 @@ impl Lumo {
     fn poll_worker(&mut self) {
         while let Ok((key, res)) = self.worker_rx.try_recv() {
             self.pending.remove(&key);
+            let source = self
+                .docs
+                .get(key.0)
+                .and_then(|d| d.pages.get(key.1))
+                .cloned();
             let entry = match res {
-                Ok(decode::DecodedImage { image }) => Entry {
-                    original: Some(Arc::new(image)),
-                    approx_bytes: 0, // filled below
-                    ..Entry::empty()
-                },
+                Ok(decode::DecodedImage { image }) => {
+                    let dims = (image.width(), image.height());
+                    Entry {
+                        original: Some(Arc::new(image)),
+                        dims: Some(dims),
+                        source,
+                        ..Entry::empty()
+                    }
+                }
                 Err(e) => Entry {
                     failed: Some(format!("{e}")),
+                    source,
                     ..Entry::empty()
                 },
             };
-            let mut entry = entry;
-            if let Some(o) = &entry.original {
-                entry.approx_bytes =
-                    (o.width() as usize) * (o.height() as usize) * 8 + 64;
-            }
-            let was_new = self.cache.insert(key, entry).is_none();
-            if was_new {
+            if self.cache.insert(key, entry).is_none() {
                 self.cache_order.push(key);
-                self.cache_bytes += self.cache.get(&key).map(|e| e.approx_bytes).unwrap_or(0);
-                self.evict();
             }
+            self.evict();
         }
     }
 
     fn evict(&mut self) {
+        self.cache_bytes = self.cache.values().map(|e| e.approx_bytes()).sum();
         let cur = self.key();
         while self.cache_bytes > MAX_CACHE_BYTES && self.cache_order.len() > 3 {
-            let Some(idx) = self.cache_order.iter().position(|k| *k != cur) else {
+            // Evict the entry furthest from the current page (LRU-ish), but
+            // never the page on screen.
+            let Some(idx) = self
+                .cache_order
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| **k != cur)
+                .max_by_key(|(_, k)| {
+                    let (d, p) = (k.0 as i64, k.1 as i64);
+                    let (cd, cp) = (cur.0 as i64, cur.1 as i64);
+                    -((d - cd).abs() + (p - cp).abs())
+                })
+                .map(|(i, _)| i)
+            else {
                 break;
             };
             let k = self.cache_order.remove(idx);
             if let Some(e) = self.cache.remove(&k) {
-                self.cache_bytes = self.cache_bytes.saturating_sub(e.approx_bytes);
+                self.cache_bytes = self.cache_bytes.saturating_sub(e.approx_bytes());
             }
         }
+    }
+
+    /// Drop the full-resolution `original` of pages we're not looking at and
+    /// can't edit right now. The GPU texture stays, so flipping back is still
+    /// instant; the pixels are re-decoded only if an edit is requested.
+    fn trim_originals(&mut self) {
+        let cur = self.key();
+        let keys: Vec<PageKey> = self.cache.keys().copied().collect();
+        for k in keys {
+            if k == cur || !self.effective_ops(k).is_empty() {
+                continue;
+            }
+            let drop = self
+                .cache
+                .get(&k)
+                .is_some_and(|e| e.original.is_some() && e.texture.is_some());
+            if drop {
+                if let Some(e) = self.cache.get_mut(&k) {
+                    e.original = None;
+                }
+            }
+        }
+        self.cache_bytes = self.cache.values().map(|e| e.approx_bytes()).sum();
+    }
+
+    /// Keep the window inside the monitor (and out from under the taskbar).
+    /// Runs until the window fits; the user can still resize afterwards.
+    fn clamp_to_monitor(&mut self, ctx: &egui::Context) {
+        if self.mon_clamped {
+            return;
+        }
+        let vp = ctx.input(|i| i.viewport().clone());
+        let Some(mon) = vp.monitor_size else {
+            return;
+        };
+        if vp.maximized == Some(true) || vp.fullscreen == Some(true) {
+            self.mon_clamped = true;
+            return;
+        }
+        let Some(rect) = vp.inner_rect else {
+            return;
+        };
+        // Reserve a strip for the taskbar/dock.
+        let max_size = Vec2::new(mon.x, (mon.y - 48.0).max(240.0));
+        let mut size = rect.size();
+        let mut pos = rect.min;
+        let mut changed = false;
+        if size.x > max_size.x {
+            size.x = max_size.x;
+            changed = true;
+        }
+        if size.y > max_size.y {
+            size.y = max_size.y;
+            changed = true;
+        }
+        if pos.x < 0.0 {
+            pos.x = 0.0;
+            changed = true;
+        }
+        if pos.y < 0.0 {
+            pos.y = 0.0;
+            changed = true;
+        }
+        if pos.x + size.x > mon.x {
+            pos.x = (mon.x - size.x).max(0.0);
+            changed = true;
+        }
+        if pos.y + size.y > mon.y {
+            pos.y = (mon.y - size.y).max(0.0);
+            changed = true;
+        }
+        if changed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
+        self.mon_clamped = true;
     }
 
     // ------------------------------------------------------- editing
@@ -456,6 +567,9 @@ impl Lumo {
                 e.edited = None;
                 e.tex_sig = None;
                 e.texture = None;
+            }
+            if self.edits.get(&key).is_some_and(|l| l.is_empty()) {
+                self.edits.remove(&key);
             }
         } else if !self.adjust.is_neutral() {
             self.adjust = Adjust::default();
@@ -801,12 +915,30 @@ impl Lumo {
         if let Some(f) = entry.failed.clone() {
             return Prepared::Failed(f);
         }
-        let Some(original) = entry.original.as_ref().map(Arc::clone) else {
-            return Prepared::Loading;
-        };
 
         let ops = self.effective_ops(key);
         let sig = edit::signature(&ops);
+
+        let original = match entry.original.as_ref().map(Arc::clone) {
+            Some(o) => Some(o),
+            None => {
+                // The original was dropped to keep RAM down. Without edits we
+                // can show the cached texture as-is; with edits we re-decode.
+                if ops.is_empty() {
+                    if let Some(tex) = entry.texture.clone() {
+                        return Prepared::Ready {
+                            texture: tex,
+                            edited: false,
+                        };
+                    }
+                } else if let Some(src) = entry.source.clone() {
+                    self.request(key, &src);
+                }
+                return Prepared::Loading;
+            }
+        };
+        let original = original.unwrap();
+
         let image: Arc<image::DynamicImage> = if ops.is_empty() {
             original
         } else {
@@ -1625,10 +1757,12 @@ enum Action {
 }
 
 impl eframe::App for Lumo {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
         self.ensure_current();
         self.prefetch();
+        self.trim_originals();
+        self.clamp_to_monitor(ctx);
 
         // expire old toasts while hidden
         if let Some((_, t)) = self.toast.clone() {
@@ -1637,6 +1771,7 @@ impl eframe::App for Lumo {
             }
         }
     }
+
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();

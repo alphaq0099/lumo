@@ -62,12 +62,14 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 })
                 .collect();
             p.add(Shape::line(pts, stroke));
-            // arrowhead tangent at pt1, pointing along dir
+            // Arrowhead: tip pushed forward along the tangent, base spread
+            // along the *radial* direction (perpendicular to the tangent).
+            // Using the tangent for the base too makes the triangle
+            // degenerate (zero area), which tessellates into a huge sliver.
             let t_ang = a1 - dir * std::f32::consts::FRAC_PI_2;
             let tip = Pos2::new(pt1.x + t_ang.cos() * 0.30 * g.s, pt1.y + t_ang.sin() * 0.30 * g.s);
-            let s_ang = a1 + dir * std::f32::consts::FRAC_PI_2;
-            let b0 = Pos2::new(pt1.x + s_ang.cos() * 0.17 * g.s, pt1.y + s_ang.sin() * 0.17 * g.s);
-            let b1 = Pos2::new(pt1.x - s_ang.cos() * 0.17 * g.s, pt1.y - s_ang.sin() * 0.17 * g.s);
+            let b0 = Pos2::new(pt1.x + a1.cos() * 0.17 * g.s, pt1.y + a1.sin() * 0.17 * g.s);
+            let b1 = Pos2::new(pt1.x - a1.cos() * 0.17 * g.s, pt1.y - a1.sin() * 0.17 * g.s);
             p.add(Shape::convex_polygon(vec![tip, b0, b1], color, Stroke::NONE));
         }
         Icon::Crop => {
