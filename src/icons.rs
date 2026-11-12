@@ -7,15 +7,12 @@ use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke};
 pub enum Icon {
     Prev,
     Next,
-    PrevFile,
-    NextFile,
     RotateL,
     RotateR,
     Crop,
     Undo,
     Open,
     Save,
-    Check,
 }
 
 /// Map normalized coords [-1..1] (y down) into `rect`.
@@ -43,33 +40,45 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
 
     match icon {
         Icon::Prev | Icon::Next => chevron(p, &g, stroke, if icon == Icon::Prev { -1.0 } else { 1.0 }, 0.0),
-        Icon::PrevFile | Icon::NextFile => {
-            let dir = if icon == Icon::PrevFile { -1.0 } else { 1.0 };
-            chevron(p, &g, stroke, dir, -0.35 * dir);
-            chevron(p, &g, stroke, dir, 0.75 * dir);
-        }
         Icon::RotateL | Icon::RotateR => {
+            // In egui's y-down coords, increasing angle sweeps CLOCKWISE on
+            // screen, so RotateL must sweep with decreasing angle.
             let dir = if icon == Icon::RotateL { -1.0 } else { 1.0 };
-            // open circular arc with an arrow tip at the end
-            let a0 = if dir < 0.0 { std::f32::consts::PI * 0.28 } else { std::f32::consts::PI * 1.72 };
-            let a1 = a0 - dir * std::f32::consts::PI * 1.35;
-            let n = 24;
-            let pt1 = g.pt(0.55 * a1.cos(), 0.55 * a1.sin());
+            // Open circular arc with a solid arrowhead at the end, pointing
+            // the way the image will turn.
+            let a0 = if dir < 0.0 { std::f32::consts::PI * 1.70 } else { std::f32::consts::PI * 0.30 };
+            let a1 = a0 + dir * std::f32::consts::PI * 1.30;
+            let n = 28;
             let pts: Vec<Pos2> = (0..=n)
                 .map(|i| {
                     let a = a0 + (a1 - a0) * (i as f32 / n as f32);
                     g.pt(0.55 * a.cos(), 0.55 * a.sin())
                 })
                 .collect();
-            p.add(Shape::line(pts, stroke));
-            // Arrowhead: tip pushed forward along the tangent, base spread
-            // along the *radial* direction (perpendicular to the tangent).
-            // Using the tangent for the base too makes the triangle
-            // degenerate (zero area), which tessellates into a huge sliver.
-            let t_ang = a1 - dir * std::f32::consts::FRAC_PI_2;
-            let tip = Pos2::new(pt1.x + t_ang.cos() * 0.30 * g.s, pt1.y + t_ang.sin() * 0.30 * g.s);
-            let b0 = Pos2::new(pt1.x + a1.cos() * 0.17 * g.s, pt1.y + a1.sin() * 0.17 * g.s);
-            let b1 = Pos2::new(pt1.x - a1.cos() * 0.17 * g.s, pt1.y - a1.sin() * 0.17 * g.s);
+            p.add(Shape::line(pts, Stroke::new(w * 0.9, color)));
+            // Arrowhead at the arc end: tip pushed forward along the motion
+            // tangent, base spread along the radial direction (perpendicular
+            // to the tangent). Using the tangent for the base too would make
+            // the triangle degenerate (zero area) — that tessellates into a
+            // huge screen-spanning sliver, so never do that.
+            let (t_x, t_y) = if dir > 0.0 {
+                (-a1.sin(), a1.cos())
+            } else {
+                (a1.sin(), -a1.cos())
+            };
+            let base = g.pt(0.55 * a1.cos(), 0.55 * a1.sin());
+            let tip = Pos2::new(
+                base.x + t_x * 0.55 * g.s,
+                base.y + t_y * 0.55 * g.s,
+            );
+            let b0 = Pos2::new(
+                base.x + a1.cos() * 0.30 * g.s,
+                base.y + a1.sin() * 0.30 * g.s,
+            );
+            let b1 = Pos2::new(
+                base.x - a1.cos() * 0.30 * g.s,
+                base.y - a1.sin() * 0.30 * g.s,
+            );
             p.add(Shape::convex_polygon(vec![tip, b0, b1], color, Stroke::NONE));
         }
         Icon::Crop => {
@@ -139,12 +148,6 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 1.0,
                 color,
             );
-        }
-        Icon::Check => {
-            p.add(Shape::line(
-                vec![g.pt(-0.5, 0.05), g.pt(-0.1, 0.5), g.pt(0.65, -0.55)],
-                Stroke::new(w * 1.2, color),
-            ));
         }
     }
 }

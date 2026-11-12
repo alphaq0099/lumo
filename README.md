@@ -54,6 +54,10 @@ frame (animation playback is on the roadmap).
 | `Ctrl`+`C` | copy image to clipboard |
 | `F11` / `F` | fullscreen |
 
+The toolbar mirrors the common actions: prev/next, a view-mode button that
+shows the current zoom (`fit`, `1:1`, or a percentage — click to switch
+between fit and 100%), rotate left/right, crop, undo, open and save.
+
 Pages extracted from archives/PDFs cannot be overwritten in place; `Ctrl+S`
 refuses and points at `Save As`.
 

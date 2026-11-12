@@ -30,7 +30,15 @@ pub fn spawn() -> (mpsc::Sender<Request>, mpsc::Receiver<Reply>) {
             while let Ok(req) = rx.recv() {
                 match req {
                     Request::Fetch { key, source } => {
-                        let result = decode_page(&mut zips, &source);
+                        // A malformed file must not be able to kill the worker
+                        // (a panic here would leave every later page stuck on
+                        // the loading spinner forever).
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            decode_page(&mut zips, &source)
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!("The decoder crashed on this file."))
+                        });
                         // Channel may be gone at shutdown; ignore.
                         let _ = data_tx.send((key, result));
                     }

@@ -966,6 +966,18 @@ impl Lumo {
 
     fn prepare(&mut self, ctx: &egui::Context) -> Prepared {
         let key = self.key();
+
+        // A document with no pages (or a position outside it) can never be
+        // decoded; say so instead of spinning forever.
+        let has_page = self.doc().is_some_and(|d| self.cur_page < d.pages.len());
+        if !has_page {
+            let msg = self
+                .doc()
+                .and_then(|d| d.error.clone())
+                .unwrap_or_else(|| "This document has no pages.".to_string());
+            return Prepared::Failed(msg);
+        }
+
         if !self.cache.contains_key(&key) {
             self.ensure_current();
             return Prepared::Loading;
@@ -1150,31 +1162,39 @@ impl Lumo {
             }
 
             // ---- row 2: slim icon strip
-            let crop_mode = self.crop_mode;
             ui.horizontal(|ui| {
                 ui.add_space(2.0);
                 // (icon buttons are a method on Self below — borrowing self
                 // only per call, so plain button actions can interleave)
 
-                self.icon_btn(ui, icons::Icon::Prev, "Previous page (←)", Action::Prev);
-                self.icon_btn(ui, icons::Icon::Next, "Next page (→ / Space)", Action::Next);
+                // One pair of arrows does both jobs: within a multi-page album
+                // they step page by page, and at the ends they cross into the
+                // neighbouring file. PgUp/PgDn jump files directly.
+                self.icon_btn(ui, icons::Icon::Prev, "Previous (← / Space; PgUp = previous file)", Action::Prev);
+                self.icon_btn(ui, icons::Icon::Next, "Next (→ / Space; PgDn = next file)", Action::Next);
                 ui.separator();
-                self.icon_btn(ui, icons::Icon::PrevFile, "Previous file (PgUp)", Action::PrevDoc);
-                self.icon_btn(ui, icons::Icon::NextFile, "Next file (PgDn)", Action::NextDoc);
-                ui.separator();
+
+                // View mode: shows the current mode, click to switch.
+                let mode_label: String = match self.zoom {
+                    Zoom::Fit => "fit".into(),
+                    Zoom::Scale(s) if (s - 1.0).abs() < 1e-3 => "1:1".into(),
+                    Zoom::Scale(s) => format!("{}%", (s * 100.0).round() as i32),
+                };
+                let mode_tip = if matches!(self.zoom, Zoom::Fit) {
+                    "View: fit to window — click to switch to 100% (0 / 1)"
+                } else {
+                    "View: 100% — click to switch to fit (0 / 1)"
+                };
                 if ui
-                    .add(egui::Button::new("fit").small())
-                    .on_hover_text("Fit to window (0)")
+                    .add_sized([46.0, 22.0], egui::Button::new(mode_label.as_str()).small())
+                    .on_hover_text(mode_tip)
                     .clicked()
                 {
-                    self.do_action(ui.ctx(), Action::Fit);
-                }
-                if ui
-                    .add(egui::Button::new("1:1").small())
-                    .on_hover_text("Zoom 100% (1)")
-                    .clicked()
-                {
-                    self.do_action(ui.ctx(), Action::Zoom100);
+                    if matches!(self.zoom, Zoom::Fit) {
+                        self.do_action(ui.ctx(), Action::Zoom100);
+                    } else {
+                        self.do_action(ui.ctx(), Action::Fit);
+                    }
                 }
                 ui.separator();
                 self.icon_btn(ui, icons::Icon::RotateL, "Rotate left (Ctrl+L)", Action::RotateL);
@@ -1182,19 +1202,9 @@ impl Lumo {
                 self.icon_btn(
                     ui,
                     icons::Icon::Crop,
-                    "Crop (Ctrl+X): drag a box, Enter applies",
+                    "Crop (Ctrl+X): drag a box on the image, Enter applies",
                     Action::Crop,
                 );
-                if crop_mode {
-                    self.icon_btn(ui, icons::Icon::Check, "Apply crop (Enter)", Action::CropApply);
-                    if ui
-                        .add(egui::Button::new("cancel").small())
-                        .on_hover_text("Cancel crop (Esc)")
-                        .clicked()
-                    {
-                        self.do_action(ui.ctx(), Action::CropCancel);
-                    }
-                }
                 ui.separator();
                 self.icon_btn(ui, icons::Icon::Undo, "Undo (Ctrl+Z)", Action::Undo);
                 self.icon_btn(ui, icons::Icon::Open, "Open files (Ctrl+O)", Action::Open);
@@ -1426,7 +1436,15 @@ impl Lumo {
 
         match prepared {
             Prepared::Loading => {
-                ui.put(avail.shrink2(Vec2::splat(80.0)), egui::Spinner::new().size(56.0));
+                let center = avail.center();
+                ui.put(
+                    Rect::from_center_size(center - Vec2::new(0.0, 14.0), Vec2::splat(56.0)),
+                    egui::Spinner::new().size(56.0),
+                );
+                ui.put(
+                    Rect::from_center_size(center + Vec2::new(0.0, 48.0), Vec2::new(320.0, 22.0)),
+                    egui::Label::new(egui::RichText::new("Loading…").size(14.0).weak()),
+                );
                 // keep polling the decode thread
                 ctx.request_repaint();
             }
@@ -1743,25 +1761,26 @@ impl Lumo {
             if resp.drag_stopped() {
                 if let Some(r) = self.crop_rect {
                     if r.width() < 4.0 || r.height() < 4.0 {
+                        // too small to be a real selection: discard it
                         self.crop_rect = None;
-                        self.crop_start = None;
                     }
-                } else {
-                    self.crop_start = None;
                 }
+                // The box is finalized either way; the next drag starts a
+                // fresh one and the apply/cancel bar may now appear.
+                self.crop_start = None;
             }
         }
 
-        // Overlay: dim everything outside the crop box.
+        // Overlay: dim everything outside the crop box, then park the
+        // apply/cancel bar just under the selection (flipped above it when
+        // there isn't room below).
         if let Some(cr) = self.crop_rect {
             let screen = Rect::from_min_size(
                 rect.min + Vec2::new(cr.min.x * sx, cr.min.y * sy),
                 Vec2::new(cr.width() * sx, cr.height() * sy),
             );
             let p = ui.painter();
-            p.rect_filled(rect, 0.0, Color32::from_black_alpha(140));
-            p.rect_filled(screen, 0.0, Color32::TRANSPARENT);
-            // punch the hole by drawing the four dimmed strips
+            // Dim only what is outside the box: four strips around it.
             let left = Rect::from_min_max(Pos2::new(rect.min.x, rect.min.y), Pos2::new(screen.min.x, rect.max.y));
             let right = Rect::from_min_max(Pos2::new(screen.max.x, rect.min.y), Pos2::new(rect.max.x, rect.max.y));
             let top = Rect::from_min_max(Pos2::new(screen.min.x, rect.min.y), Pos2::new(screen.max.x, screen.min.y));
@@ -1772,25 +1791,44 @@ impl Lumo {
                 }
             }
             p.rect_stroke(screen, 0.0, egui::Stroke::new(2.0, Color32::WHITE), egui::StrokeKind::Middle);
-        }
 
-        // Floating apply/cancel bar
-        Area::new(egui::Id::unique("lumo-crop"))
-            .anchor(Align2::CENTER_TOP, [0.0, 40.0])
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("Apply crop (⏎)")
-                        .on_hover_text("Crop to the highlighted area")
-                        .clicked()
-                    {
-                        self.do_action(ctx, Action::CropApply);
-                    }
-                    if ui.button("Cancel (Esc)").clicked() {
-                        self.do_action(ctx, Action::CropCancel);
-                    }
-                });
-            });
+            // The bar only shows once the box is finalized (drag released).
+            if self.crop_start.is_none() {
+                let bar_w = 252.0;
+                let bar_h = 40.0;
+                let mut origin = Pos2::new(screen.center().x - bar_w / 2.0, screen.max.y + 10.0);
+                if origin.y + bar_h > rect.max.y {
+                    origin.y = (screen.min.y - bar_h - 10.0).max(rect.min.y);
+                }
+                origin.x = origin
+                    .x
+                    .clamp(rect.min.x, (rect.max.x - bar_w).max(rect.min.x));
+
+                Area::new(egui::Id::unique("lumo-crop"))
+                    .fixed_pos(origin)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.style_mut().spacing.button_padding = Vec2::new(14.0, 9.0);
+                            if ui
+                                .add_sized(
+                                    [132.0, 36.0],
+                                    egui::Button::new("Apply crop (⏎)"),
+                                )
+                                .on_hover_text("Crop to the highlighted area")
+                                .clicked()
+                            {
+                                self.do_action(ctx, Action::CropApply);
+                            }
+                            if ui
+                                .add_sized([104.0, 36.0], egui::Button::new("Cancel (Esc)"))
+                                .clicked()
+                            {
+                                self.do_action(ctx, Action::CropCancel);
+                            }
+                        });
+                    });
+            }
+        }
     }
 }
 
