@@ -1231,11 +1231,12 @@ impl Lumo {
                 self.icon_btn(ui, icons::Icon::RotateR, "Rotate right (Ctrl+R)", Action::RotateR);
                 self.icon_btn(ui, icons::Icon::FlipH, "Flip horizontal (Ctrl+H)", Action::FlipH);
                 self.icon_btn(ui, icons::Icon::FlipV, "Flip vertical (Ctrl+V)", Action::FlipV);
-                self.icon_btn(
+                self.icon_btn_active(
                     ui,
                     icons::Icon::Crop,
                     "Crop (Ctrl+X): drag a box on the image, Enter applies",
                     Action::Crop,
+                    self.crop_mode,
                 );
                 ui.separator();
                 self.icon_btn(ui, icons::Icon::Undo, "Undo (Ctrl+Z)", Action::Undo);
@@ -1249,17 +1250,34 @@ impl Lumo {
     /// One 26-px vector-icon button in the slim actions row. Borrows `self`
     /// only for the call, so it may be interleaved with other `self` uses.
     fn icon_btn(&mut self, ui: &mut egui::Ui, icon: icons::Icon, tip: &str, action: Action) {
+        self.icon_btn_active(ui, icon, tip, action, false);
+    }
+
+    /// Same button, but `selected` pins the hover shade on so the user can
+    /// see the mode is active (crop while a selection is being drawn).
+    fn icon_btn_active(
+        &mut self,
+        ui: &mut egui::Ui,
+        icon: icons::Icon,
+        tip: &str,
+        action: Action,
+        selected: bool,
+    ) {
         let size = egui::Vec2::splat(26.0);
         let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-        let fg = if resp.hovered() || resp.is_pointer_button_down_on() {
+        let hot = resp.hovered() || resp.is_pointer_button_down_on();
+        if selected || hot {
+            ui.painter().rect_filled(
+                rect.expand2(egui::vec2(2.0, 1.0)),
+                4.0,
+                ui.visuals().widgets.hovered.bg_fill,
+            );
+        }
+        let fg = if selected || hot {
             ui.visuals().widgets.hovered.fg_stroke.color
         } else {
             ui.visuals().widgets.inactive.fg_stroke.color
         };
-        if resp.hovered() {
-            ui.painter()
-                .rect_filled(rect.expand2(egui::vec2(2.0, 1.0)), 4.0, ui.visuals().widgets.hovered.bg_fill);
-        }
         icons::paint(ui.painter(), rect.shrink2(egui::Vec2::splat(3.5)), icon, fg);
         let resp = resp.on_hover_text(tip);
         if resp.clicked() {

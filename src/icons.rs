@@ -89,31 +89,23 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
             p.add(Shape::convex_polygon(vec![tip, b0, b1], color, Stroke::NONE));
         }
         Icon::FlipH | Icon::FlipV => {
-            // Dashed mirror line (vertical for FlipH, horizontal for FlipV)
-            // plus two mirrored triangles either side of it.
+            // A solid triangle and its outlined mirror across a gap — no
+            // axis line, which at button size just read as a plus sign.
+            // Flat/wide pair for FlipH, tall pair for FlipV.
             let along_h = icon == Icon::FlipH;
-            let mut i = 0.0;
-            while i < 4.0 {
-                let t0 = -0.85 + i * 0.45;
-                let t1 = t0 + 0.25;
-                let (a, b) = if along_h {
-                    (g.pt(0.0, t0), g.pt(0.0, t1))
-                } else {
-                    (g.pt(t0, 0.0), g.pt(t1, 0.0))
-                };
-                p.add(Shape::line(vec![a, b], stroke));
-                i += 1.0;
-            }
-            // triangles: perpendicular offset pair, pointing away from the axis
             let tri = |s: f32| -> Vec<Pos2> {
                 if along_h {
-                    vec![g.pt(s * 0.12, -0.42), g.pt(s * 0.12, 0.42), g.pt(s * 0.82, 0.0)]
+                    vec![g.pt(s * 0.10, -0.60), g.pt(s * 0.10, 0.60), g.pt(s * 0.92, 0.0)]
                 } else {
-                    vec![g.pt(-0.42, s * 0.12), g.pt(0.42, s * 0.12), g.pt(0.0, s * 0.82)]
+                    vec![g.pt(-0.60, s * 0.10), g.pt(0.60, s * 0.10), g.pt(0.0, s * 0.92)]
                 }
             };
             p.add(Shape::convex_polygon(tri(1.0), color, Stroke::NONE));
-            p.add(Shape::convex_polygon(tri(-1.0), color, Stroke::NONE));
+            p.add(Shape::convex_polygon(
+                tri(-1.0),
+                Color32::TRANSPARENT,
+                Stroke::new(w * 0.9, color),
+            ));
         }
         Icon::Crop => {
             // two crossing L-brackets, the classic crop glyph
