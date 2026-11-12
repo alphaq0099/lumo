@@ -59,13 +59,21 @@ impl Entry {
         }
     }
 
-    /// Rough resident cost: the decoded pixels plus the GPU texture copy.
+    /// Rough resident cost: the decoded pixels (if still held) plus the GPU
+    /// texture copy (if uploaded).
     fn approx_bytes(&self) -> usize {
         let Some((w, h)) = self.dims else {
             return 0;
         };
         let px = (w as usize) * (h as usize) * 4;
-        px + if self.texture.is_some() { px } else { 0 } + 64
+        let mut b = 0;
+        if self.original.is_some() {
+            b += px;
+        }
+        if self.texture.is_some() {
+            b += px;
+        }
+        b + 64
     }
 }
 
@@ -92,6 +100,8 @@ pub struct Lumo {
     pan: Vec2,
     zoom_anim: Option<ZoomAnim>,
     wheel_zoom_pct: f32, // how much one wheel notch zooms, in %
+    /// Drop decoded pages as soon as you leave them (see ⚙ menu).
+    low_memory: bool,
     last_avail: Rect,
     fullscreen: bool,
 
@@ -134,7 +144,9 @@ impl Lumo {
             zoom: Zoom::Fit,
             pan: Vec2::ZERO,
             zoom_anim: None,
-            wheel_zoom_pct: Self::load_wheel_zoom_pct(),
+            wheel_zoom_pct: Self::load_setting("wheel_zoom_pct", 13.0)
+                .clamp(1.0, 80.0),
+            low_memory: Self::load_setting("low_memory", 0.0) >= 0.5,
             last_avail: Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0)),
             fullscreen: false,
             panel_open: false,
@@ -236,21 +248,23 @@ impl Lumo {
         Some(std::path::PathBuf::from(dir).join("lumo").join("lumo.conf"))
     }
 
-    fn load_wheel_zoom_pct() -> f32 {
-        let Some(path) = Self::config_path() else { return 13.0 };
+    fn load_setting(key: &str, default: f32) -> f32 {
+        let Some(path) = Self::config_path() else {
+            return default;
+        };
         match std::fs::read_to_string(&path) {
             Ok(txt) => {
                 for line in txt.lines() {
-                    if let Some(v) = line.strip_prefix("wheel_zoom_pct") {
+                    if let Some(v) = line.strip_prefix(key) {
                         let v = v.trim().trim_start_matches('=').trim();
                         if let Ok(p) = v.parse::<f32>() {
-                            return p.clamp(1.0, 80.0);
+                            return p;
                         }
                     }
                 }
-                13.0
+                default
             }
-            Err(_) => 13.0,
+            Err(_) => default,
         }
     }
 
@@ -259,7 +273,11 @@ impl Lumo {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let txt = format!("wheel_zoom_pct = {:.1}\n", self.wheel_zoom_pct.round());
+        let txt = format!(
+            "wheel_zoom_pct = {:.1}\nlow_memory = {}\n",
+            self.wheel_zoom_pct.round(),
+            if self.low_memory { 1 } else { 0 }
+        );
         let _ = std::fs::write(&path, txt);
     }
 
@@ -363,7 +381,15 @@ impl Lumo {
         let mut wants: Vec<(PageKey, doc::PageSource)> = Vec::new();
 
         if let Some(d) = self.docs.get(cur) {
-            for dp in [curp + 1, curp + 2, curp.wrapping_sub(1)] {
+            // In low-memory mode only the immediate neighbours are kept, so
+            // there is no point decoding further ahead.
+            let offsets: &[usize] = if self.low_memory {
+                &[curp.wrapping_sub(1), curp + 1]
+            } else {
+                &[curp + 1, curp + 2, curp.wrapping_sub(1)]
+            };
+            for dp in offsets {
+                let dp = *dp;
                 if dp < d.pages.len() {
                     if let Some(src) = d.pages.get(dp) {
                         wants.push(((cur, dp), src.clone()));
@@ -447,11 +473,40 @@ impl Lumo {
     /// Drop the full-resolution `original` of pages we're not looking at and
     /// can't edit right now. The GPU texture stays, so flipping back is still
     /// instant; the pixels are re-decoded only if an edit is requested.
-    fn trim_originals(&mut self) {
+    /// Is `k` close enough to the current page to keep decoded in low-memory
+    /// mode? Current page ±1, plus the page you'd land on in a neighbouring
+    /// document (its first page going forward, its last page going back).
+    fn in_low_memory_window(&self, k: PageKey) -> bool {
+        let cur = self.key();
+        if k == cur {
+            return true;
+        }
+        if k.0 == cur.0 {
+            return (k.1 as i64 - cur.1 as i64).abs() <= 1;
+        }
+        if k.0 + 1 == cur.0 {
+            return self
+                .docs
+                .get(k.0)
+                .is_some_and(|d| d.pages.len().saturating_sub(1) == k.1);
+        }
+        if k.0 == cur.0 + 1 {
+            return k.1 == 0;
+        }
+        false
+    }
+
+    fn trim_cache(&mut self) {
         let cur = self.key();
         let keys: Vec<PageKey> = self.cache.keys().copied().collect();
+        let mut removed: Vec<PageKey> = Vec::new();
         for k in keys {
+            // The page on screen, and anything with unsaved edits, always stay.
             if k == cur || !self.effective_ops(k).is_empty() {
+                continue;
+            }
+            if self.low_memory && !self.in_low_memory_window(k) {
+                removed.push(k);
                 continue;
             }
             let drop = self
@@ -463,6 +518,10 @@ impl Lumo {
                     e.original = None;
                 }
             }
+        }
+        for k in removed {
+            self.cache.remove(&k);
+            self.cache_order.retain(|x| *x != k);
         }
         self.cache_bytes = self.cache.values().map(|e| e.approx_bytes()).sum();
     }
@@ -1043,6 +1102,16 @@ impl Lumo {
                         if zr.changed() {
                             self.save_settings();
                         }
+                        let lm = ui.checkbox(&mut self.low_memory, "Low memory mode");
+                        if lm.changed() {
+                            self.save_settings();
+                        }
+                        lm.on_hover_text(
+                            "Keep only the page you are on and its immediate neighbours decoded.\n\
+                             Everything else is dropped as you leave it, so memory stays flat\n\
+                             no matter how long the queue is. Flipping back far re-decodes\n\
+                             (a brief spinner).",
+                        );
                         ui.separator();
                         ui.label(
                             egui::RichText::new(format!(
@@ -1761,7 +1830,7 @@ impl eframe::App for Lumo {
         self.poll_worker();
         self.ensure_current();
         self.prefetch();
-        self.trim_originals();
+        self.trim_cache();
         self.clamp_to_monitor(ctx);
 
         // expire old toasts while hidden
