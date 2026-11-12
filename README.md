@@ -56,7 +56,10 @@ frame (animation playback is on the roadmap).
 
 The toolbar mirrors the common actions: prev/next, a view-mode button that
 shows the current zoom (`fit`, `1:1`, or a percentage — click to switch
-between fit and 100%), rotate left/right, crop, undo, open and save.
+between fit and 100%), rotate left/right, flip horizontal/vertical, crop,
+undo, open and save. When the zoomed image is larger than the window,
+overlay scrollbars appear at the right and bottom edges and can be dragged
+to pan.
 
 Pages extracted from archives/PDFs cannot be overwritten in place; `Ctrl+S`
 refuses and points at `Save As`.

@@ -117,6 +117,8 @@ pub struct Lumo {
 }
 
 enum Prepared {
+    /// Nothing open: show the app-name splash.
+    Empty,
     Loading,
     Failed(String),
     Ready {
@@ -188,6 +190,20 @@ impl Lumo {
         self.crop_start = None;
         self.crop_rect = None;
         self.adjust = Adjust::default();
+    }
+
+    /// Switch to 100% with the image centered in the viewport (the pan is
+    /// then within the clamp range either way: centered when it fits,
+    /// mid-range when it overflows).
+    fn enter_zoom100(&mut self, ctx: &egui::Context) {
+        self.zoom = Zoom::Scale(1.0);
+        self.zoom_anim = None;
+        let avail = self.last_avail;
+        if let Some(px) = self.best_texture_size(ctx) {
+            self.pan = (avail.size() - Vec2::new(px.x, px.y)) / 2.0;
+        } else {
+            self.pan = Vec2::ZERO;
+        }
     }
 
     // ------------------------------------------------------- smooth zoom
@@ -850,10 +866,7 @@ impl Lumo {
             Action::ZoomIn => self.zoom_by(1.25, None, ctx),
             Action::ZoomOut => self.zoom_by(1.0 / 1.25, None, ctx),
             Action::Fit => self.reset_view(),
-            Action::Zoom100 => {
-                self.zoom = Zoom::Scale(1.0);
-                self.pan = Vec2::ZERO;
-            }
+            Action::Zoom100 => self.enter_zoom100(ctx),
             Action::Open => self.open_dialog(),
             Action::Save => self.save_overwrite(),
             Action::SaveAs => self.save_dialog(),
@@ -946,6 +959,22 @@ impl Lumo {
         Some(Vec2::new(img.width() as f32, img.height() as f32))
     }
 
+    /// Pan clamped per axis: center when the image fits, else keep an edge
+    /// reachable (0 = left/top edge, negative = right/bottom content).
+    fn clamp_pan(pan: Vec2, vp: Vec2, size: Vec2) -> Vec2 {
+        let axis = |p: f32, vp_v: f32, size_v: f32| -> f32 {
+            if size_v <= vp_v {
+                (vp_v - size_v) / 2.0
+            } else {
+                p.clamp(vp_v - size_v, 0.0)
+            }
+        };
+        Vec2::new(
+            axis(pan.x, vp.x, size.x),
+            axis(pan.y, vp.y, size.y),
+        )
+    }
+
     fn view_origin(&self, avail: Rect, ctx: &egui::Context) -> Pos2 {
         let Some(size_px) = self.best_texture_size(ctx) else {
             return avail.center();
@@ -955,17 +984,18 @@ impl Lumo {
             Zoom::Scale(s) => s,
         };
         let size = Vec2::new(size_px.x * scale, size_px.y * scale);
-        if size.x <= avail.width() && size.y <= avail.height() {
-            avail.min + (avail.size() - size) / 2.0
-        } else {
-            avail.min + self.pan
-        }
+        avail.min + Self::clamp_pan(self.pan, avail.size(), size)
     }
 
     // ------------------------------------------------------- prepared image
 
     fn prepare(&mut self, ctx: &egui::Context) -> Prepared {
         let key = self.key();
+
+        // Nothing open at all: show the app-name splash instead of an error.
+        if self.docs.is_empty() {
+            return Prepared::Empty;
+        }
 
         // A document with no pages (or a position outside it) can never be
         // decoded; say so instead of spinning forever.
@@ -1199,6 +1229,8 @@ impl Lumo {
                 ui.separator();
                 self.icon_btn(ui, icons::Icon::RotateL, "Rotate left (Ctrl+L)", Action::RotateL);
                 self.icon_btn(ui, icons::Icon::RotateR, "Rotate right (Ctrl+R)", Action::RotateR);
+                self.icon_btn(ui, icons::Icon::FlipH, "Flip horizontal (Ctrl+H)", Action::FlipH);
+                self.icon_btn(ui, icons::Icon::FlipV, "Flip vertical (Ctrl+V)", Action::FlipV);
                 self.icon_btn(
                     ui,
                     icons::Icon::Crop,
@@ -1435,6 +1467,24 @@ impl Lumo {
         let _ = &mut repainted_hints;
 
         match prepared {
+            Prepared::Empty => {
+                // Idle opening: just the app name, big, bold and grey.
+                let band = Rect::from_center_size(
+                    avail.center(),
+                    Vec2::new(avail.width(), 120.0),
+                );
+                ui.put(
+                    band,
+                    egui::Label::new(
+                        egui::RichText::new("lumo")
+                            .strong()
+                            .size(88.0)
+                            .color(Color32::from_rgb(150, 150, 150)),
+                    )
+                    .halign(egui::Align::Center)
+                    .selectable(false),
+                );
+            }
             Prepared::Loading => {
                 let center = avail.center();
                 ui.put(
@@ -1469,25 +1519,15 @@ impl Lumo {
                 self.zoom_tick(&ctx);
                 let (scale, mut pan) = self.zoom_display(fit);
 
-                // Clamp pan so the image doesn't wander off.
+                // Clamp pan per axis: when the image fits, center it; when it
+                // overflows, keep an edge reachable (0 = left/top, negative =
+                // right/bottom content).
                 let size = Vec2::new(img_size.x * scale, img_size.y * scale);
-                let clamp_axis = |p: f32, avail_v: f32, size_v: f32| -> f32 {
-                    if size_v <= avail_v {
-                        0.0
-                    } else {
-                        p.clamp(avail_v - size_v, 0.0)
-                    }
-                };
-                pan.x = clamp_axis(pan.x, avail.width(), size.x);
-                pan.y = clamp_axis(pan.y, avail.height(), size.y);
+                pan = Self::clamp_pan(pan, avail.size(), size);
                 if self.zoom_anim.is_none() {
                     self.pan = pan;
                 }
-                let origin = if size.x <= avail.width() && size.y <= avail.height() {
-                    avail.min + (avail.size() - size) / 2.0
-                } else {
-                    avail.min + pan
-                };
+                let origin = avail.min + pan;
                 let rect = Rect::from_min_size(origin, size);
                 let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
                 ui.painter()
@@ -1523,21 +1563,19 @@ impl Lumo {
                     }
                 }
 
-                // ---- drag pan
+                // ---- drag pan (content follows the cursor)
                 if resp.dragged() && !self.crop_mode {
-                    self.pan -= resp.drag_delta();
+                    self.pan += resp.drag_delta();
                     self.zoom_anim = None;
                 }
 
                 // ---- double click: fit ↔ 100%
                 if resp.double_clicked() {
-                    self.zoom = if self.zoom == Zoom::Scale(1.0) {
-                        Zoom::Fit
+                    if self.zoom == Zoom::Scale(1.0) {
+                        self.reset_view();
                     } else {
-                        Zoom::Scale(1.0)
-                    };
-                    self.pan = Vec2::ZERO;
-                    self.zoom_anim = None;
+                        self.enter_zoom100(&ctx);
+                    }
                 }
 
                 // ---- edge hover arrows (appear at the window ends only
@@ -1545,6 +1583,11 @@ impl Lumo {
                 //      is near that end)
                 if !self.crop_mode {
                     self.edge_arrows(ui, &ctx, avail);
+                }
+
+                // ---- overlay scrollbars when the image overflows
+                if !self.crop_mode {
+                    self.scrollbars(ui, avail, size);
                 }
 
                 // ---- crop
@@ -1564,6 +1607,68 @@ impl Lumo {
     /// flaticon "right arrow" style, and a quick fade + slide animation
     /// when it appears on hover. Only drawn while the cursor hovers the
     /// strip, and only when a previous/next page exists in the selection.
+    /// Overlay scrollbars (right = vertical, bottom = horizontal) shown only
+    /// when the zoomed image overflows the viewport. Dragging a thumb pans
+    /// the image; they are painted last so they win interaction over the
+    /// pan gesture underneath.
+    fn scrollbars(&mut self, ui: &mut egui::Ui, avail: Rect, content: Vec2) {
+        let vp = avail.size();
+        if content.x <= vp.x && content.y <= vp.y {
+            return;
+        }
+        let hover_col = ui.visuals().widgets.hovered.fg_stroke.color;
+        let idle_col = Color32::from_white_alpha(90);
+        let p = ui.painter();
+
+        let v_show = content.y > vp.y + 1.0;
+        let h_show = content.x > vp.x + 1.0;
+
+        if v_show {
+            let track = Rect::from_min_max(
+                Pos2::new(avail.max.x - 12.0, avail.min.y + 2.0),
+                Pos2::new(avail.max.x - 4.0, avail.max.y - if h_show { 12.0 } else { 2.0 }),
+            );
+            let resp = ui.interact(track, egui::Id::unique("lumo-vscroll"), egui::Sense::drag());
+            let frac = (vp.y / content.y).clamp(0.05, 1.0);
+            let thumb_len = track.height() * frac;
+            let scrollable = content.y - vp.y;
+            let t = (-self.pan.y / scrollable).clamp(0.0, 1.0);
+            let thumb = Rect::from_min_size(
+                Pos2::new(track.min.x, track.min.y + t * (track.height() - thumb_len)),
+                Vec2::new(track.width(), thumb_len),
+            );
+            p.rect_filled(track, 4.0, Color32::from_black_alpha(40));
+            p.rect_filled(thumb, 4.0, if resp.hovered() || resp.dragged() { hover_col } else { idle_col });
+            if resp.dragged() {
+                // Thumb down = view moves down = pan.y decreases (origin up).
+                self.pan.y -= resp.drag_delta().y * (content.y / vp.y);
+                self.zoom_anim = None;
+            }
+        }
+
+        if h_show {
+            let track = Rect::from_min_max(
+                Pos2::new(avail.min.x + 2.0, avail.max.y - 12.0),
+                Pos2::new(avail.max.x - if v_show { 12.0 } else { 4.0 }, avail.max.y - 4.0),
+            );
+            let resp = ui.interact(track, egui::Id::unique("lumo-hscroll"), egui::Sense::drag());
+            let frac = (vp.x / content.x).clamp(0.05, 1.0);
+            let thumb_len = track.width() * frac;
+            let scrollable = content.x - vp.x;
+            let t = (-self.pan.x / scrollable).clamp(0.0, 1.0);
+            let thumb = Rect::from_min_size(
+                Pos2::new(track.min.x + t * (track.width() - thumb_len), track.min.y),
+                Vec2::new(thumb_len, track.height()),
+            );
+            p.rect_filled(track, 4.0, Color32::from_black_alpha(40));
+            p.rect_filled(thumb, 4.0, if resp.hovered() || resp.dragged() { hover_col } else { idle_col });
+            if resp.dragged() {
+                self.pan.x -= resp.drag_delta().x * (content.x / vp.x);
+                self.zoom_anim = None;
+            }
+        }
+    }
+
     fn edge_arrows(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, avail: Rect) {
         let zone_w = 88.0f32.min(avail.width() * 0.4);
         if zone_w < 8.0 {

@@ -9,6 +9,8 @@ pub enum Icon {
     Next,
     RotateL,
     RotateR,
+    FlipH,
+    FlipV,
     Crop,
     Undo,
     Open,
@@ -41,12 +43,17 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
     match icon {
         Icon::Prev | Icon::Next => chevron(p, &g, stroke, if icon == Icon::Prev { -1.0 } else { 1.0 }, 0.0),
         Icon::RotateL | Icon::RotateR => {
-            // In egui's y-down coords, increasing angle sweeps CLOCKWISE on
-            // screen, so RotateL must sweep with decreasing angle.
+            // Both heads sit at the BOTTOM, mirrored across the vertical
+            // axis (angle a -> π - a maps RotateL's arc onto RotateR's):
+            // left icon's head at bottom-right pointing CCW, right icon's at
+            // bottom-left pointing CW. In egui's y-down coords, increasing
+            // angle sweeps CLOCKWISE on screen.
             let dir = if icon == Icon::RotateL { -1.0 } else { 1.0 };
-            // Open circular arc with a solid arrowhead at the end, pointing
-            // the way the image will turn.
-            let a0 = if dir < 0.0 { std::f32::consts::PI * 1.70 } else { std::f32::consts::PI * 0.30 };
+            let a0 = if dir < 0.0 {
+                std::f32::consts::PI * 1.70
+            } else {
+                -std::f32::consts::PI * 0.70
+            };
             let a1 = a0 + dir * std::f32::consts::PI * 1.30;
             let n = 28;
             let pts: Vec<Pos2> = (0..=n)
@@ -80,6 +87,33 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 base.y - a1.sin() * 0.30 * g.s,
             );
             p.add(Shape::convex_polygon(vec![tip, b0, b1], color, Stroke::NONE));
+        }
+        Icon::FlipH | Icon::FlipV => {
+            // Dashed mirror line (vertical for FlipH, horizontal for FlipV)
+            // plus two mirrored triangles either side of it.
+            let along_h = icon == Icon::FlipH;
+            let mut i = 0.0;
+            while i < 4.0 {
+                let t0 = -0.85 + i * 0.45;
+                let t1 = t0 + 0.25;
+                let (a, b) = if along_h {
+                    (g.pt(0.0, t0), g.pt(0.0, t1))
+                } else {
+                    (g.pt(t0, 0.0), g.pt(t1, 0.0))
+                };
+                p.add(Shape::line(vec![a, b], stroke));
+                i += 1.0;
+            }
+            // triangles: perpendicular offset pair, pointing away from the axis
+            let tri = |s: f32| -> Vec<Pos2> {
+                if along_h {
+                    vec![g.pt(s * 0.12, -0.42), g.pt(s * 0.12, 0.42), g.pt(s * 0.82, 0.0)]
+                } else {
+                    vec![g.pt(-0.42, s * 0.12), g.pt(0.42, s * 0.12), g.pt(0.0, s * 0.82)]
+                }
+            };
+            p.add(Shape::convex_polygon(tri(1.0), color, Stroke::NONE));
+            p.add(Shape::convex_polygon(tri(-1.0), color, Stroke::NONE));
         }
         Icon::Crop => {
             // two crossing L-brackets, the classic crop glyph
