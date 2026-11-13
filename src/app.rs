@@ -108,6 +108,13 @@ pub struct Lumo {
     /// last mouse move (None while not fullscreen).
     chrome_until: Option<std::time::Instant>,
     last_pointer: Option<Pos2>,
+    /// Animated bar visibility 1 = shown, 0 = hidden (fullscreen only).
+    chrome_anim: f32,
+    /// Setting: seconds the bars stay up after the last mouse move.
+    chrome_hide_secs: f32,
+    /// Natural panel heights, measured in windowed mode, used to animate.
+    top_full_h: f32,
+    status_full_h: f32,
 
     panel_open: bool,
     crop_mode: bool,
@@ -157,6 +164,10 @@ impl Lumo {
             fullscreen: false,
             chrome_until: None,
             last_pointer: None,
+            chrome_anim: 1.0,
+            chrome_hide_secs: Self::load_setting("chrome_hide_secs", 2.5).clamp(0.0, 10.0),
+            top_full_h: 88.0,
+            status_full_h: 30.0,
             panel_open: false,
             crop_mode: false,
             crop_start: None,
@@ -296,9 +307,10 @@ impl Lumo {
             let _ = std::fs::create_dir_all(dir);
         }
         let txt = format!(
-            "wheel_zoom_pct = {:.1}\nlow_memory = {}\n",
+            "wheel_zoom_pct = {:.1}\nlow_memory = {}\nchrome_hide_secs = {:.1}\n",
             self.wheel_zoom_pct.round(),
-            if self.low_memory { 1 } else { 0 }
+            if self.low_memory { 1 } else { 0 },
+            self.chrome_hide_secs.clamp(0.0, 10.0),
         );
         let _ = std::fs::write(&path, txt);
     }
@@ -913,6 +925,17 @@ impl Lumo {
             Action::Fullscreen => {
                 self.fullscreen = !self.fullscreen;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+                // On entering, show the bars for the configured grace time;
+                // on leaving, bring them back fully.
+                if self.fullscreen {
+                    self.chrome_until = Some(
+                        std::time::Instant::now()
+                            + std::time::Duration::from_secs_f32(self.chrome_hide_secs.max(0.0)),
+                    );
+                } else {
+                    self.chrome_until = None;
+                }
+                self.chrome_anim = 1.0;
             }
             Action::Exit => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1098,8 +1121,40 @@ impl Lumo {
 
     /// Proper top bar: menu row (File / View / Edit / ⚙) over a slim row of
     /// vector-icon buttons for frequent actions; file info in the center.
+    /// Smoothed bar visibility for animation (0..1), windowed mode is always 1.
+    fn chrome_vis(&self) -> f32 {
+        if !self.fullscreen {
+            return 1.0;
+        }
+        let p = self.chrome_anim.clamp(0.0, 1.0);
+        p * p * (3.0 - 2.0 * p) // smoothstep
+    }
+
     fn topbar(&mut self, ui: &mut egui::Ui) {
-        Panel::top("lumo-topbar").show(ui, |ui| {
+        if self.fullscreen {
+            // Animated: the bar slides out through the top as its height
+            // shrinks (contents are clipped to the panel rect).
+            let vis = self.chrome_vis();
+            if vis <= 0.005 {
+                return;
+            }
+            Panel::top("lumo-topbar")
+                .resizable(false)
+                .exact_size((self.top_full_h * vis).max(2.0))
+                .show(ui, |ui| self.topbar_body(ui));
+        } else {
+            let r = Panel::top("lumo-topbar").show(ui, |ui| self.topbar_body(ui));
+            // Remember the natural height so the fullscreen animation
+            // starts from the right size.
+            let h = r.response.rect.height();
+            if h > 10.0 {
+                self.top_full_h = h;
+            }
+        }
+    }
+
+    fn topbar_body(&mut self, ui: &mut egui::Ui) {
+        {
             ui.add_space(2.0);
 
             // ---- row 1: menu bar + centered file info + settings on the right
@@ -1170,6 +1225,24 @@ impl Lumo {
                              no matter how long the queue is. Flipping back far re-decodes\n\
                              (a brief spinner).",
                         );
+                        ui.horizontal(|ui| {
+                            ui.label("Fullscreen: hide bars after");
+                            let hs = ui
+                                .add(
+                                    egui::DragValue::new(&mut self.chrome_hide_secs)
+                                        .speed(0.1)
+                                        .range(0.0..=10.0)
+                                        .suffix(" s"),
+                                )
+                                .on_hover_text(
+                                    "How long the menu/icon bars stay visible in fullscreen after\n\
+                                     the mouse last moved. 0 = hide immediately (the slide-out\n\
+                                     animation still plays).",
+                                );
+                            if hs.changed() {
+                                self.save_settings();
+                            }
+                        });
                         ui.separator();
                         ui.label(
                             egui::RichText::new(format!(
@@ -1260,7 +1333,7 @@ impl Lumo {
                 self.icon_btn(ui, icons::Icon::Save, "Save (Ctrl+S)", Action::Save);
             });
             ui.add_space(2.0);
-        });
+        }
     }
 
     /// One 26-px vector-icon button in the slim actions row. Borrows `self`
@@ -1406,7 +1479,27 @@ impl Lumo {
     }
 
     fn status(&mut self, ui: &mut egui::Ui) {
-        Panel::bottom("lumo-status").show(ui, |ui| {
+        if self.fullscreen {
+            // Animated: the bar slides down out of view as its height shrinks.
+            let vis = self.chrome_vis();
+            if vis <= 0.005 {
+                return;
+            }
+            Panel::bottom("lumo-status")
+                .resizable(false)
+                .exact_size((self.status_full_h * vis).max(2.0))
+                .show(ui, |ui| self.status_body(ui));
+        } else {
+            let r = Panel::bottom("lumo-status").show(ui, |ui| self.status_body(ui));
+            let h = r.response.rect.height();
+            if h > 10.0 {
+                self.status_full_h = h;
+            }
+        }
+    }
+
+    fn status_body(&mut self, ui: &mut egui::Ui) {
+        {
             ui.horizontal(|ui| {
                 // Left side: file & page identity
                 let location = match self.doc() {
@@ -1485,7 +1578,7 @@ impl Lumo {
                     self.toast = None;
                 }
             }
-        });
+        }
     }
 
     // ------------------------------------------------------- image view
@@ -2025,14 +2118,14 @@ impl eframe::App for Lumo {
         self.handle_input(&ctx);
 
         // In fullscreen the image gets the whole window: the top bar and
-        // status line hide, and reappear for a couple of seconds whenever
-        // the mouse moves.
+        // status line slide away, and reappear whenever the mouse moves.
         if self.fullscreen {
             let pos = ctx.input(|i| i.pointer.latest_pos());
             if pos != self.last_pointer {
                 self.last_pointer = pos;
                 self.chrome_until = Some(
-                    std::time::Instant::now() + std::time::Duration::from_secs_f32(2.5),
+                    std::time::Instant::now()
+                        + std::time::Duration::from_secs_f32(self.chrome_hide_secs.max(0.0)),
                 );
             }
             // egui sleeps while idle; without this the expiry instant would
@@ -2050,13 +2143,23 @@ impl eframe::App for Lumo {
             || self
                 .chrome_until
                 .is_some_and(|t| std::time::Instant::now() < t);
-        if show_chrome {
-            self.topbar(ui);
+
+        // Drive the slide animation: full travel in 0.3 s.
+        let target: f32 = if show_chrome { 1.0 } else { 0.0 };
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.05);
+        let step = dt / 0.30;
+        self.chrome_anim = if self.chrome_anim < target {
+            (self.chrome_anim + step).min(target)
+        } else {
+            (self.chrome_anim - step).max(target)
+        };
+        if self.fullscreen && self.chrome_anim != target {
+            ctx.request_repaint(); // keep the animation running
         }
+
+        self.topbar(ui);
         self.edit_panel(ui);
-        if show_chrome {
-            self.status(ui);
-        }
+        self.status(ui);
 
         CentralPanel::default()
             .frame(Frame::NONE)
