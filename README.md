@@ -52,7 +52,7 @@ frame (animation playback is on the roadmap).
 | `Ctrl`+`S` | save — overwrites the original, keeps a one-time `.original.` backup |
 | `Ctrl`+`Shift`+`S` | save as (PNG/JPEG/WebP/TIFF/BMP/TGA/QOI/…, JPEG q92 / auto defaults) |
 | `Ctrl`+`C` | copy image to clipboard |
-| `F11` / `F` | fullscreen |
+| `F11` / `F` | fullscreen — image only: the bars hide and reappear for a moment when the mouse moves; `Esc` exits |
 
 The toolbar mirrors the common actions: prev/next, a view-mode button that
 shows the current zoom (`fit`, `1:1`, or a percentage — click to switch

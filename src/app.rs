@@ -104,6 +104,10 @@ pub struct Lumo {
     low_memory: bool,
     last_avail: Rect,
     fullscreen: bool,
+    /// Fullscreen chrome auto-hide: show bars until this instant after the
+    /// last mouse move (None while not fullscreen).
+    chrome_until: Option<std::time::Instant>,
+    last_pointer: Option<Pos2>,
 
     panel_open: bool,
     crop_mode: bool,
@@ -151,6 +155,8 @@ impl Lumo {
             low_memory: Self::load_setting("low_memory", 0.0) >= 0.5,
             last_avail: Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0)),
             fullscreen: false,
+            chrome_until: None,
+            last_pointer: None,
             panel_open: false,
             crop_mode: false,
             crop_start: None,
@@ -840,6 +846,9 @@ impl Lumo {
             }
             if i.key_pressed(Key::Escape) && crop_mode {
                 actions.push(Action::CropCancel);
+            }
+            if i.key_pressed(Key::Escape) && !crop_mode && self.fullscreen {
+                actions.push(Action::Fullscreen);
             }
             let _ = shift;
         });
@@ -2015,9 +2024,39 @@ impl eframe::App for Lumo {
         self.incoming_files(&ctx);
         self.handle_input(&ctx);
 
-        self.topbar(ui);
+        // In fullscreen the image gets the whole window: the top bar and
+        // status line hide, and reappear for a couple of seconds whenever
+        // the mouse moves.
+        if self.fullscreen {
+            let pos = ctx.input(|i| i.pointer.latest_pos());
+            if pos != self.last_pointer {
+                self.last_pointer = pos;
+                self.chrome_until = Some(
+                    std::time::Instant::now() + std::time::Duration::from_secs_f32(2.5),
+                );
+            }
+            // egui sleeps while idle; without this the expiry instant would
+            // never be painted and the bars would stay on screen.
+            if let Some(t) = self.chrome_until {
+                let wait = (t - std::time::Instant::now()).as_secs_f32();
+                if wait > 0.0 {
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f32(wait + 0.02));
+                }
+            }
+        } else {
+            self.chrome_until = None;
+        }
+        let show_chrome = !self.fullscreen
+            || self
+                .chrome_until
+                .is_some_and(|t| std::time::Instant::now() < t);
+        if show_chrome {
+            self.topbar(ui);
+        }
         self.edit_panel(ui);
-        self.status(ui);
+        if show_chrome {
+            self.status(ui);
+        }
 
         CentralPanel::default()
             .frame(Frame::NONE)
