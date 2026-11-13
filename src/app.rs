@@ -955,8 +955,15 @@ impl Lumo {
     fn best_texture_size(&self, _ctx: &egui::Context) -> Option<Vec2> {
         let key = self.key();
         let e = self.cache.get(&key)?;
-        let img = e.edited.as_ref().map(|(_, i)| i).or(e.original.as_ref())?;
-        Some(Vec2::new(img.width() as f32, img.height() as f32))
+        if let Some((_, img)) = e.edited.as_ref() {
+            return Some(Vec2::new(img.width() as f32, img.height() as f32));
+        }
+        if let Some(img) = e.original.as_ref() {
+            return Some(Vec2::new(img.width() as f32, img.height() as f32));
+        }
+        // The decoded CPU copy was dropped to save RAM and only the GPU
+        // texture remains — use the dimensions recorded at decode time.
+        e.dims.map(|(w, h)| Vec2::new(w as f32, h as f32))
     }
 
     /// Pan clamped per axis: center when the image fits, else keep an edge
