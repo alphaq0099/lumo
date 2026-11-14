@@ -117,6 +117,9 @@ pub struct Lumo {
     last_view_size: Vec2,
     /// Setting: seconds the bars stay up after the last mouse move.
     chrome_hide_secs: f32,
+    /// Setting: hide the window while switching fullscreen (masks the resize
+    /// garbage on Windows). Default on for Windows builds.
+    fs_mask: bool,
     /// Natural panel heights, measured in windowed mode, used to animate.
     top_full_h: f32,
     status_full_h: f32,
@@ -173,6 +176,7 @@ impl Lumo {
             repaint_until: None,
             last_view_size: Vec2::ZERO,
             chrome_hide_secs: Self::load_setting("chrome_hide_secs", 2.5).clamp(0.0, 10.0),
+            fs_mask: Self::load_setting("fs_mask", if cfg!(windows) { 1.0 } else { 0.0 }) >= 0.5,
             top_full_h: 88.0,
             status_full_h: 30.0,
             panel_open: false,
@@ -314,10 +318,11 @@ impl Lumo {
             let _ = std::fs::create_dir_all(dir);
         }
         let txt = format!(
-            "wheel_zoom_pct = {:.1}\nlow_memory = {}\nchrome_hide_secs = {:.1}\n",
+            "wheel_zoom_pct = {:.1}\nlow_memory = {}\nchrome_hide_secs = {:.1}\nfs_mask = {}\n",
             self.wheel_zoom_pct.round(),
             if self.low_memory { 1 } else { 0 },
             self.chrome_hide_secs.clamp(0.0, 10.0),
+            if self.fs_mask { 1 } else { 0 },
         );
         let _ = std::fs::write(&path, txt);
     }
@@ -931,7 +936,17 @@ impl Lumo {
             Action::Panel => self.panel_open = !self.panel_open,
             Action::Fullscreen => {
                 self.fullscreen = !self.fullscreen;
+                // Windows ghosts (stale window copies) and can flash black
+                // while it resizes the window for fullscreen. Hide the window
+                // for the ~100 ms the switch takes so none of that is visible.
+                if self.fs_mask {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+                if self.fs_mask {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
                 // The OS window resize arrives asynchronously; repaint for a
                 // moment so no stale-geometry frame lingers on screen.
                 self.repaint_until =
@@ -1143,16 +1158,22 @@ impl Lumo {
 
     fn topbar(&mut self, ui: &mut egui::Ui) {
         if self.fullscreen {
-            // Animated: the bar slides out through the top as its height
-            // shrinks (contents are clipped to the panel rect).
+            // Overlay, not a panel: the image keeps the whole window, so it
+            // never rescales when the bars appear or hide. The bar floats
+            // above the image and slides out through the top edge.
             let vis = self.chrome_vis();
             if vis <= 0.005 {
                 return;
             }
-            Panel::top("lumo-topbar")
-                .resizable(false)
-                .exact_size((self.top_full_h * vis).max(2.0))
-                .show(ui, |ui| self.topbar_body(ui));
+            let style = ui.style().clone();
+            let slide = (self.top_full_h + 2.0) * (1.0 - vis);
+            let win_w = ui.ctx().input(|i| i.viewport_rect().width());
+            Area::new(egui::Id::unique("lumo-fs-top"))
+                .anchor(Align2::CENTER_TOP, [0.0, -slide])
+                .show(ui.ctx(), |ui| {
+                    ui.set_min_width(win_w);
+                    Frame::central_panel(&style).show(ui, |ui| self.topbar_body(ui));
+                });
         } else {
             let r = Panel::top("lumo-topbar").show(ui, |ui| self.topbar_body(ui));
             // Remember the natural height so the fullscreen animation
@@ -1254,6 +1275,20 @@ impl Lumo {
                                 self.save_settings();
                             }
                         });
+                        let fm = ui.checkbox(
+                            &mut self.fs_mask,
+                            "Clean fullscreen switch (hide window during the change)",
+                        );
+                        if fm.changed() {
+                            self.save_settings();
+                        }
+                        fm.on_hover_text(
+                            "Windows shows ghosting or a black flash while it resizes the window\n\
+                             for fullscreen. With this on, lumo hides the window for the moment\n\
+                             the switch takes, so the change looks like a clean blink.\n\
+                             Uncheck if the keyboard seems unresponsive after a switch\n\
+                             (clicking the window fixes focus).",
+                        );
                         ui.separator();
                         ui.label(
                             egui::RichText::new(format!(
@@ -1491,15 +1526,21 @@ impl Lumo {
 
     fn status(&mut self, ui: &mut egui::Ui) {
         if self.fullscreen {
-            // Animated: the bar slides down out of view as its height shrinks.
+            // Overlay, same as the top bar: floats above the image, slides
+            // down out of view.
             let vis = self.chrome_vis();
             if vis <= 0.005 {
                 return;
             }
-            Panel::bottom("lumo-status")
-                .resizable(false)
-                .exact_size((self.status_full_h * vis).max(2.0))
-                .show(ui, |ui| self.status_body(ui));
+            let style = ui.style().clone();
+            let slide = (self.status_full_h + 2.0) * (1.0 - vis);
+            let win_w = ui.ctx().input(|i| i.viewport_rect().width());
+            Area::new(egui::Id::unique("lumo-fs-status"))
+                .anchor(Align2::CENTER_BOTTOM, [0.0, slide])
+                .show(ui.ctx(), |ui| {
+                    ui.set_min_width(win_w);
+                    Frame::central_panel(&style).show(ui, |ui| self.status_body(ui));
+                });
         } else {
             let r = Panel::bottom("lumo-status").show(ui, |ui| self.status_body(ui));
             let h = r.response.rect.height();
