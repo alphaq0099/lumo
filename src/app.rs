@@ -120,6 +120,9 @@ pub struct Lumo {
     /// Setting: hide the window while switching fullscreen (masks the resize
     /// garbage on Windows). Default on for Windows builds.
     fs_mask: bool,
+    /// Setting: double-click on the image toggles fullscreen (instead of
+    /// fit ↔ 100%).
+    dbl_fs: bool,
     /// Natural panel heights, measured in windowed mode, used to animate.
     top_full_h: f32,
     status_full_h: f32,
@@ -177,6 +180,7 @@ impl Lumo {
             last_view_size: Vec2::ZERO,
             chrome_hide_secs: Self::load_setting("chrome_hide_secs", 2.5).clamp(0.0, 10.0),
             fs_mask: Self::load_setting("fs_mask", if cfg!(windows) { 1.0 } else { 0.0 }) >= 0.5,
+            dbl_fs: Self::load_setting("dbl_fs", 1.0) >= 0.5,
             top_full_h: 88.0,
             status_full_h: 30.0,
             panel_open: false,
@@ -318,11 +322,12 @@ impl Lumo {
             let _ = std::fs::create_dir_all(dir);
         }
         let txt = format!(
-            "wheel_zoom_pct = {:.1}\nlow_memory = {}\nchrome_hide_secs = {:.1}\nfs_mask = {}\n",
+            "wheel_zoom_pct = {:.1}\nlow_memory = {}\nchrome_hide_secs = {:.1}\nfs_mask = {}\ndbl_fs = {}\n",
             self.wheel_zoom_pct.round(),
             if self.low_memory { 1 } else { 0 },
             self.chrome_hide_secs.clamp(0.0, 10.0),
             if self.fs_mask { 1 } else { 0 },
+            if self.dbl_fs { 1 } else { 0 },
         );
         let _ = std::fs::write(&path, txt);
     }
@@ -1289,6 +1294,18 @@ impl Lumo {
                              Uncheck if the keyboard seems unresponsive after a switch\n\
                              (clicking the window fixes focus).",
                         );
+                        let df = ui.checkbox(
+                            &mut self.dbl_fs,
+                            "Double-click on the image toggles fullscreen",
+                        );
+                        if df.changed() {
+                            self.save_settings();
+                        }
+                        df.on_hover_text(
+                            "On: double-clicking the image enters or leaves fullscreen.\n\
+                             Off: double-clicking switches between fit and 100%.\n\
+                             (Keys 0 / 1 still switch fit and 100% either way.)",
+                        );
                         ui.separator();
                         ui.label(
                             egui::RichText::new(format!(
@@ -1758,9 +1775,11 @@ impl Lumo {
                     self.zoom_anim = None;
                 }
 
-                // ---- double click: fit ↔ 100%
-                if resp.double_clicked() {
-                    if self.zoom == Zoom::Scale(1.0) {
+                // ---- double click: fullscreen toggle (setting), else fit ↔ 100%
+                if !self.crop_mode && resp.double_clicked() {
+                    if self.dbl_fs {
+                        self.do_action(&ctx, Action::Fullscreen);
+                    } else if self.zoom == Zoom::Scale(1.0) {
                         self.reset_view();
                     } else {
                         self.enter_zoom100(&ctx);
