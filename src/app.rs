@@ -110,6 +110,11 @@ pub struct Lumo {
     last_pointer: Option<Pos2>,
     /// Animated bar visibility 1 = shown, 0 = hidden (fullscreen only).
     chrome_anim: f32,
+    /// While set and in the future, keep repainting every frame to flush
+    /// stale/torn frames after a window resize (e.g. fullscreen toggles).
+    repaint_until: Option<std::time::Instant>,
+    /// View size of the previous frame, to detect viewport resizes.
+    last_view_size: Vec2,
     /// Setting: seconds the bars stay up after the last mouse move.
     chrome_hide_secs: f32,
     /// Natural panel heights, measured in windowed mode, used to animate.
@@ -165,6 +170,8 @@ impl Lumo {
             chrome_until: None,
             last_pointer: None,
             chrome_anim: 1.0,
+            repaint_until: None,
+            last_view_size: Vec2::ZERO,
             chrome_hide_secs: Self::load_setting("chrome_hide_secs", 2.5).clamp(0.0, 10.0),
             top_full_h: 88.0,
             status_full_h: 30.0,
@@ -925,6 +932,10 @@ impl Lumo {
             Action::Fullscreen => {
                 self.fullscreen = !self.fullscreen;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+                // The OS window resize arrives asynchronously; repaint for a
+                // moment so no stale-geometry frame lingers on screen.
+                self.repaint_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs_f32(0.8));
                 // On entering, show the bars for the configured grace time;
                 // on leaving, bring them back fully.
                 if self.fullscreen {
@@ -1585,6 +1596,16 @@ impl Lumo {
 
     fn view_ui(&mut self, ui: &mut egui::Ui) {
         let avail = ui.available_rect_before_wrap();
+        // A viewport resize (entering/leaving fullscreen, dragging an edge) can
+        // leave one or more frames painted with the old geometry — stretched or
+        // torn content. Don't carry a zoom animation through the size change,
+        // and keep repainting briefly so the settled frame shows fast.
+        if (avail.size() - self.last_view_size).length() > 0.5 {
+            self.last_view_size = avail.size();
+            self.zoom_anim = None;
+            self.repaint_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs_f32(0.6));
+        }
         self.last_avail = avail;
         let resp = ui.allocate_rect(avail, egui::Sense::click_and_drag());
         let ctx = ui.ctx().clone();
@@ -2155,6 +2176,15 @@ impl eframe::App for Lumo {
         };
         if self.fullscreen && self.chrome_anim != target {
             ctx.request_repaint(); // keep the animation running
+        }
+
+        // Flush stale frames after a window resize (fullscreen toggles).
+        if let Some(t) = self.repaint_until {
+            if std::time::Instant::now() < t {
+                ctx.request_repaint();
+            } else {
+                self.repaint_until = None;
+            }
         }
 
         self.topbar(ui);
