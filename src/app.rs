@@ -79,7 +79,6 @@ impl Entry {
 
 /// Soft ceiling for the decoded-page cache. Pages are cheap to re-decode from
 /// local files, so evict rather than grow without bound.
-const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 pub struct Lumo {
     docs: Vec<Document>,
@@ -123,6 +122,53 @@ pub struct Lumo {
     /// Setting: double-click on the image toggles fullscreen (instead of
     /// fit ↔ 100%).
     dbl_fs: bool,
+    // --- reading behavior ---
+    /// Wheel turns pages instead of zooming (Ctrl+wheel still zooms).
+    wheel_pages: bool,
+    /// Keep zoom/pan when moving between pages.
+    remember_zoom: bool,
+    /// 0 = fit whole image, 1 = fit width, 2 = fit height.
+    fit_mode: i32,
+    /// Autoscroll speed in view-heights per second (hold ↓/↑).
+    autoscroll_speed: f32,
+    // --- slideshow ---
+    sliding: bool,
+    slide_next: Option<Instant>,
+    /// Slideshow interval seconds.
+    slide_secs: f32,
+    /// Slideshow wraps to the first page at the end.
+    slide_loop: bool,
+    /// Wheel-line accumulator for the wheel-pages mode.
+    wheel_page_acc: f32,
+    // --- look ---
+    /// Light theme instead of dark.
+    theme_light: bool,
+    /// View background color (0xRRGGBB).
+    view_bg: u32,
+    /// Smooth (linear) texture filtering vs pixelated (nearest).
+    smooth_scale: bool,
+    /// Hide the mouse cursor after this many idle seconds in fullscreen (0 = off).
+    hide_cursor_secs: f32,
+    cursor_until: Option<Instant>,
+    // --- startup / window ---
+    /// Restore the last window position and size.
+    remember_win: bool,
+    /// Open in fullscreen at launch.
+    start_fs: bool,
+    startup_done: bool,
+    /// Reopen the previously opened files when launched without arguments.
+    reopen_last: bool,
+    /// Window rect to persist (windowed mode only).
+    win_rect: Option<Rect>,
+    /// Close-time save has already happened.
+    exit_saved: bool,
+    // --- files ---
+    /// JPEG save quality 1-100.
+    jpeg_q: f32,
+    /// 0 = selection order, 1 = name A→Z, 2 = name Z→A, 3 = newest, 4 = oldest.
+    sort_mode: i32,
+    /// Decode cache budget in MB.
+    cache_mb: f32,
     /// Natural panel heights, measured in windowed mode, used to animate.
     top_full_h: f32,
     status_full_h: f32,
@@ -151,8 +197,36 @@ enum Prepared {
 }
 
 impl Lumo {
+    /// Read the remembered window rect from the config for main.rs to apply
+    /// when CREATING the window (applied there, not via commands, because the
+    /// viewport builder re-asserts its own size every frame otherwise).
+    pub fn win_rect_from_conf() -> Option<(Pos2, Vec2)> {
+        if Lumo::load_setting("remember_win", 1.0) < 0.5 {
+            return None;
+        }
+        let x = Lumo::load_setting("win_x", 0.0);
+        let y = Lumo::load_setting("win_y", 0.0);
+        let w = Lumo::load_setting("win_w", 0.0);
+        let h = Lumo::load_setting("win_h", 0.0);
+        if w > 100.0 && h > 100.0 {
+            Some((Pos2::new(x, y), Vec2::new(w, h)))
+        } else {
+            None
+        }
+    }
+
     pub fn new(docs: Vec<Document>) -> Self {
         let (worker_tx, worker_rx) = decode::spawn();
+        // With no files on the command line and the setting on, restore the
+        // previous session's files.
+        let docs = if docs.is_empty() && Self::load_setting("reopen_last", 1.0) >= 0.5 {
+            Self::load_last_session()
+        } else {
+            docs
+        };
+        // Window geometry is applied in main.rs before the window is created
+        // (win_rect_from_conf); no restore commands needed here.
+        let win_rect = None;
         Self {
             docs,
             cur_doc: 0,
@@ -181,6 +255,29 @@ impl Lumo {
             chrome_hide_secs: Self::load_setting("chrome_hide_secs", 2.5).clamp(0.0, 10.0),
             fs_mask: Self::load_setting("fs_mask", if cfg!(windows) { 1.0 } else { 0.0 }) >= 0.5,
             dbl_fs: Self::load_setting("dbl_fs", 1.0) >= 0.5,
+            wheel_pages: Self::load_setting("wheel_pages", 0.0) >= 0.5,
+            remember_zoom: Self::load_setting("remember_zoom", 0.0) >= 0.5,
+            fit_mode: Self::load_setting("fit_mode", 0.0).round() as i32,
+            autoscroll_speed: Self::load_setting("autoscroll_speed", 0.7),
+            sliding: false,
+            slide_next: None,
+            slide_secs: Self::load_setting("slide_secs", 4.0).clamp(0.5, 120.0),
+            slide_loop: Self::load_setting("slide_loop", 0.0) >= 0.5,
+            wheel_page_acc: 0.0,
+            theme_light: Self::load_setting("theme_light", 0.0) >= 0.5,
+            view_bg: Self::load_setting("view_bg", 0.0).round().clamp(0.0, 16_777_215.0) as u32,
+            smooth_scale: Self::load_setting("smooth_scale", 1.0) >= 0.5,
+            hide_cursor_secs: Self::load_setting("hide_cursor_secs", 0.0).clamp(0.0, 10.0),
+            cursor_until: None,
+            remember_win: Self::load_setting("remember_win", 1.0) >= 0.5,
+            start_fs: Self::load_setting("start_fs", 0.0) >= 0.5,
+            startup_done: false,
+            reopen_last: Self::load_setting("reopen_last", 1.0) >= 0.5,
+            win_rect,
+            exit_saved: false,
+            jpeg_q: Self::load_setting("jpeg_q", 92.0).clamp(1.0, 100.0),
+            sort_mode: Self::load_setting("sort_mode", 0.0).round() as i32,
+            cache_mb: Self::load_setting("cache_mb", 128.0).clamp(16.0, 2048.0),
             top_full_h: 88.0,
             status_full_h: 30.0,
             panel_open: false,
@@ -207,11 +304,28 @@ impl Lumo {
         self.doc().map(|d| d.pages.len()).unwrap_or(0)
     }
 
+    /// Cleanup when the shown page changes (keeps zoom when the setting says so).
+    fn page_changed(&mut self) {
+        if self.remember_zoom {
+            self.crop_mode = false;
+            self.crop_start = None;
+            self.crop_rect = None;
+            self.adjust = Adjust::default();
+        } else {
+            self.reset_view();
+        }
+        // Manual navigation restarts the slideshow timer.
+        if self.sliding {
+            self.slide_next =
+                Some(Instant::now() + std::time::Duration::from_secs_f32(self.slide_secs.max(0.5)));
+        }
+    }
+
     fn goto(&mut self, doc: usize, page: usize) {
         self.cur_doc = doc.min(self.docs.len().saturating_sub(1));
         let pmax = self.docs.get(self.cur_doc).map(|d| d.pages.len()).unwrap_or(1);
         self.cur_page = if pmax == 0 { 0 } else { page.min(pmax - 1) };
-        self.reset_view();
+        self.page_changed();
     }
 
     fn reset_view(&mut self) {
@@ -322,20 +436,78 @@ impl Lumo {
             let _ = std::fs::create_dir_all(dir);
         }
         let txt = format!(
-            "wheel_zoom_pct = {:.1}\nlow_memory = {}\nchrome_hide_secs = {:.1}\nfs_mask = {}\ndbl_fs = {}\n",
+            "wheel_zoom_pct = {:.1}\nlow_memory = {}\nchrome_hide_secs = {:.1}\nfs_mask = {}\ndbl_fs = {}\n\
+             wheel_pages = {}\nremember_zoom = {}\nfit_mode = {}\nautoscroll_speed = {:.2}\n\
+             slide_secs = {:.1}\nslide_loop = {}\ntheme_light = {}\nview_bg = {}\nsmooth_scale = {}\n\
+             hide_cursor_secs = {:.1}\nremember_win = {}\nstart_fs = {}\nreopen_last = {}\n\
+             win_x = {:.0}\nwin_y = {:.0}\nwin_w = {:.0}\nwin_h = {:.0}\n\
+             jpeg_q = {:.0}\nsort_mode = {}\ncache_mb = {:.0}\n",
             self.wheel_zoom_pct.round(),
             if self.low_memory { 1 } else { 0 },
             self.chrome_hide_secs.clamp(0.0, 10.0),
             if self.fs_mask { 1 } else { 0 },
             if self.dbl_fs { 1 } else { 0 },
+            if self.wheel_pages { 1 } else { 0 },
+            if self.remember_zoom { 1 } else { 0 },
+            self.fit_mode.clamp(0, 2),
+            self.autoscroll_speed.clamp(0.05, 5.0),
+            self.slide_secs.clamp(0.5, 120.0),
+            if self.slide_loop { 1 } else { 0 },
+            if self.theme_light { 1 } else { 0 },
+            self.view_bg,
+            if self.smooth_scale { 1 } else { 0 },
+            self.hide_cursor_secs.clamp(0.0, 10.0),
+            if self.remember_win { 1 } else { 0 },
+            if self.start_fs { 1 } else { 0 },
+            if self.reopen_last { 1 } else { 0 },
+            self.win_rect.map(|r| r.min.x).unwrap_or(0.0),
+            self.win_rect.map(|r| r.min.y).unwrap_or(0.0),
+            self.win_rect.map(|r| r.width()).unwrap_or(0.0),
+            self.win_rect.map(|r| r.height()).unwrap_or(0.0),
+            self.jpeg_q.clamp(1.0, 100.0).round(),
+            self.sort_mode.clamp(0, 4),
+            self.cache_mb.clamp(16.0, 2048.0).round(),
         );
         let _ = std::fs::write(&path, txt);
+    }
+
+    /// Save the currently open files for the next session (one path per line).
+    fn save_last_session(&self) {
+        let Some(cfg) = Self::config_path() else { return };
+        let Some(dir) = cfg.parent() else { return };
+        let _ = std::fs::create_dir_all(dir);
+        let mut txt = String::new();
+        let mut seen = std::collections::HashSet::new();
+        for d in &self.docs {
+            let p = d.path.to_string_lossy().to_string();
+            if !p.is_empty() && seen.insert(p.clone()) {
+                txt.push_str(&p);
+                txt.push('\n');
+            }
+        }
+        let _ = std::fs::write(dir.join("last.txt"), txt);
+    }
+
+    fn load_last_session() -> Vec<Document> {
+        let Some(cfg) = Self::config_path() else { return Vec::new() };
+        let Some(dir) = cfg.parent() else { return Vec::new() };
+        let Ok(txt) = std::fs::read_to_string(dir.join("last.txt")) else {
+            return Vec::new();
+        };
+        txt.lines()
+            .filter_map(|l| {
+                let p = Path::new(l);
+                (p.is_file()).then(|| p.to_path_buf())
+            })
+            .take(2000)
+            .map(|p| doc::expand(&p))
+            .collect()
     }
 
     fn next_page(&mut self) {
         if self.cur_page + 1 < self.pages() {
             self.cur_page += 1;
-            self.reset_view();
+            self.page_changed();
         } else if self.cur_doc + 1 < self.docs.len() {
             self.goto(self.cur_doc + 1, 0);
         } else if !self.docs.is_empty() {
@@ -346,7 +518,7 @@ impl Lumo {
     fn prev_page(&mut self) {
         if self.cur_page > 0 {
             self.cur_page -= 1;
-            self.reset_view();
+            self.page_changed();
         } else if !self.docs.is_empty() {
             let d = (self.cur_doc + self.docs.len() - 1) % self.docs.len();
             let n = self.docs.get(d).map(|x| x.pages.len()).unwrap_or(1);
@@ -371,6 +543,28 @@ impl Lumo {
     // ------------------------------------------------------- opening
 
     pub fn open_paths(&mut self, paths: Vec<std::path::PathBuf>) {
+        let mut paths = paths;
+        if self.sort_mode != 0 {
+            paths.sort_by(|a, b| {
+                let ord = match self.sort_mode {
+                    1 | 2 => nat_cmp(
+                        &a.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
+                        &b.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
+                    ),
+                    3 | 4 => a
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .cmp(&b.metadata().and_then(|m| m.modified()).ok()),
+                    _ => std::cmp::Ordering::Equal,
+                };
+                if self.sort_mode == 2 || self.sort_mode == 4 {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            });
+        }
         let newdocs: Vec<Document> = paths
             .iter()
             .filter(|p| p.is_file())
@@ -496,8 +690,9 @@ impl Lumo {
 
     fn evict(&mut self) {
         self.cache_bytes = self.cache.values().map(|e| e.approx_bytes()).sum();
+        let cap = (self.cache_mb.clamp(16.0, 2048.0) * 1024.0 * 1024.0) as usize;
         let cur = self.key();
-        while self.cache_bytes > MAX_CACHE_BYTES && self.cache_order.len() > 3 {
+        while self.cache_bytes > cap && self.cache_order.len() > 3 {
             // Evict the entry furthest from the current page (LRU-ish), but
             // never the page on screen.
             let Some(idx) = self
@@ -740,7 +935,7 @@ impl Lumo {
             .add_filter("Images", crate::archive::ALL_EXTS)
             .save_file()
         {
-            match crate::save::save_as(&image, &path) {
+            match crate::save::save_as(&image, &path, self.jpeg_q.clamp(1.0, 100.0) as u8) {
                 Ok(()) => self.flash = Some((format!("Saved {}", path.display()), Instant::now())),
                 Err(e) => self.toast = Some((format!("Save failed: {e}"), Instant::now())),
             }
@@ -763,7 +958,7 @@ impl Lumo {
             }
         };
         let has_edits = !self.ops(self.key()).is_empty();
-        match crate::save::overwrite(&image, &path, has_edits) {
+        match crate::save::overwrite(&image, &path, has_edits, self.jpeg_q.clamp(1.0, 100.0) as u8) {
             Ok(()) => {
                 self.flash =
                     Some((format!("Saved {}", path.display()), Instant::now()))
@@ -792,6 +987,10 @@ impl Lumo {
     fn handle_input(&mut self, ctx: &egui::Context) {
         let mut actions: Vec<Action> = Vec::new();
         let crop_mode = self.crop_mode;
+        // Computed outside the input closure: egui 0.37 guards the whole
+        // Context with one RwLock, so ctx.memory() nested inside ctx.input()
+        // would deadlock.
+        let no_focused_widget = ctx.memory(|m| m.focused().is_none());
 
         ctx.input(|i| {
             let ctrl = i.modifiers.ctrl;
@@ -878,6 +1077,13 @@ impl Lumo {
             }
             if i.key_pressed(Key::Escape) && !crop_mode && self.fullscreen {
                 actions.push(Action::Fullscreen);
+            }
+            if i.key_pressed(Key::Escape) && !crop_mode && !self.fullscreen && self.sliding {
+                actions.push(Action::Slideshow);
+            }
+            // S starts/stops the slideshow (only when no text field has focus).
+            if i.key_pressed(Key::S) && !ctrl && no_focused_widget {
+                actions.push(Action::Slideshow);
             }
             let _ = shift;
         });
@@ -968,6 +1174,20 @@ impl Lumo {
                 }
                 self.chrome_anim = 1.0;
             }
+            Action::Slideshow => {
+                self.sliding = !self.sliding;
+                if self.sliding {
+                    let secs = self.slide_secs.clamp(0.5, 120.0);
+                    self.slide_next = Some(Instant::now() + std::time::Duration::from_secs_f32(secs));
+                    self.flash = Some((
+                        format!("Slideshow on — every {:.0} s (S or Esc to stop)", secs),
+                        Instant::now(),
+                    ));
+                } else {
+                    self.slide_next = None;
+                    self.flash = Some(("Slideshow off".into(), Instant::now()));
+                }
+            }
             Action::Exit => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -1012,7 +1232,13 @@ impl Lumo {
         if tex.x <= 0.0 || tex.y <= 0.0 {
             return 1.0;
         }
-        (avail.x / tex.x).min(avail.y / tex.y)
+        let fx = avail.x / tex.x;
+        let fy = avail.y / tex.y;
+        match self.fit_mode {
+            1 => fx,          // fit width
+            2 => fy,          // fit height
+            _ => fx.min(fy), // fit whole image
+        }
     }
 
     fn best_texture_size(&self, _ctx: &egui::Context) -> Option<Vec2> {
@@ -1129,17 +1355,25 @@ impl Lumo {
 
         // (Re)build the GPU texture when the pixels changed.
         let entry = self.cache.get_mut(&key).unwrap();
-        if entry.tex_sig.as_deref() != Some(sig.as_str())
-            || entry.texture.is_none()
+        let tex_sig = format!("{sig}:{}", if self.smooth_scale { "s" } else { "n" });
+        if entry.tex_sig.as_deref() != Some(tex_sig.as_str()) || entry.texture.is_none()
         {
             let rgba = image.to_rgba8();
             let col = ColorImage::from_rgba_unmultiplied(
                 [rgba.width() as usize, rgba.height() as usize],
                 rgba.into_raw().as_slice(),
             );
-            let tex = ctx.load_texture("lumo-page", col, egui::TextureOptions::LINEAR);
+            let tex = ctx.load_texture(
+                "lumo-page",
+                col,
+                if self.smooth_scale {
+                    egui::TextureOptions::LINEAR
+                } else {
+                    egui::TextureOptions::NEAREST
+                },
+            );
             entry.texture = Some(tex);
-            entry.tex_sig = Some(sig);
+            entry.tex_sig = Some(tex_sig);
         }
 
         Prepared::Ready {
@@ -1159,6 +1393,11 @@ impl Lumo {
         }
         let p = self.chrome_anim.clamp(0.0, 1.0);
         p * p * (3.0 - 2.0 * p) // smoothstep
+    }
+
+    /// View background color from the stored 0xRRGGBB value.
+    fn bg_color(v: u32) -> Color32 {
+        Color32::from_rgb(((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8)
     }
 
     fn topbar(&mut self, ui: &mut egui::Ui) {
@@ -1216,6 +1455,7 @@ impl Lumo {
                     act(ui, Action::Zoom100);
                     act(ui, Action::Panel);
                     ui.separator();
+                    act(ui, Action::Slideshow);
                     act(ui, Action::Fullscreen);
                 });
                 ui.menu_button("Edit", |ui| {
@@ -1234,88 +1474,321 @@ impl Lumo {
             let info_left = ui.cursor().min.x;
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.menu_button("⚙", |ui| {
-                        ui.label(
-                            egui::RichText::new("Wheel zoom per notch")
+                    egui::containers::menu::MenuButton::new("⚙")
+                        .config(
+                            egui::containers::menu::MenuConfig::default()
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                        )
+                        .ui(ui, |ui| {
+                            // Stays open while you click inside, so every
+                            // option can be changed in one visit.
+                            egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
+                                ui.collapsing("Reading", |ui| {
+                                    let wp = ui.checkbox(
+                                        &mut self.wheel_pages,
+                                        "Mouse wheel turns pages",
+                                    );
+                                    if wp.changed() {
+                                        self.save_settings();
+                                    }
+                                    wp.on_hover_text(
+                                        "On: the wheel flips to the next/previous page (one notch =\n\
+                                         one page) and Ctrl+wheel zooms.\n\
+                                         Off: the wheel zooms.",
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("Wheel zoom per notch").weak().size(12.0),
+                                    );
+                                    let zr = ui
+                                        .add(
+                                            egui::DragValue::new(&mut self.wheel_zoom_pct)
+                                                .speed(0.5)
+                                                .range(1.0..=80.0)
+                                                .suffix("%"),
+                                        )
+                                        .on_hover_text(
+                                            "How much one scroll-wheel notch zooms in/out.\n\
+                                             Drag sideways to change.",
+                                        );
+                                    if zr.changed() {
+                                            self.save_settings();
+                                        }
+                                    let rz = ui.checkbox(
+                                        &mut self.remember_zoom,
+                                        "Remember zoom between pages",
+                                    );
+                                    if rz.changed() {
+                                        self.save_settings();
+                                    }
+                                    rz.on_hover_text(
+                                        "On: flipping pages keeps your zoom level and pan position.\n\
+                                         Off: every page opens fitted to the window.",
+                                    );
+                                    ui.label(egui::RichText::new("Fit mode").weak().size(12.0));
+                                    let mut fm = self.fit_mode.clamp(0, 2);
+                                    let f0 = ui.radio_value(&mut fm, 0, "Whole image");
+                                    let f1 = ui.radio_value(&mut fm, 1, "Width");
+                                    let f2 = ui.radio_value(&mut fm, 2, "Height");
+                                    if fm != self.fit_mode {
+                                        self.fit_mode = fm;
+                                        self.save_settings();
+                                    }
+                                    let _ = (f0, f1, f2);
+                                    ui.label(
+                                        egui::RichText::new("Fit width / height suits tall comic pages.")
+                                            .weak()
+                                            .size(11.0),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.label("Auto-scroll speed");
+                                        let aspd = ui
+                                            .add(
+                                                egui::DragValue::new(&mut self.autoscroll_speed)
+                                                    .speed(0.05)
+                                                    .range(0.05..=3.0)
+                                                    .suffix(" ×/s"),
+                                            )
+                                            .on_hover_text(
+                                                "Speed of the steady scroll when you HOLD ↓ or ↑\n\
+                                                 (works when the page is taller than the window,\n\
+                                                 e.g. fit-width). Value is in view-heights per second.",
+                                            );
+                                        if aspd.changed() {
+                                            self.save_settings();
+                                        }
+                                    });
+                                    let lm = ui.checkbox(&mut self.low_memory, "Low memory mode");
+                                    if lm.changed() {
+                                        self.save_settings();
+                                    }
+                                    lm.on_hover_text(
+                                        "Keep only the page you are on and its immediate\n\
+                                         neighbours decoded. Everything else is dropped as you\n\
+                                         leave it, so memory stays flat no matter how long the\n\
+                                         queue is. Flipping back far re-decodes (a brief spinner).",
+                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.label("RAM cache");
+                                        let cm = ui
+                                            .add(
+                                                egui::DragValue::new(&mut self.cache_mb)
+                                                    .speed(8.0)
+                                                    .range(32.0..=2048.0)
+                                                    .suffix(" MB"),
+                                            )
+                                            .on_hover_text(
+                                                "How many decoded pages to keep around. Lower = less\n\
+                                                 RAM, more re-decoding when you flip back.",
+                                            );
+                                        if cm.changed() {
+                                            self.save_settings();
+                                        }
+                                    });
+                                });
+                                ui.collapsing("Fullscreen", |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Hide bars after");
+                                        let hs = ui
+                                            .add(
+                                                egui::DragValue::new(&mut self.chrome_hide_secs)
+                                                    .speed(0.1)
+                                                    .range(0.0..=10.0)
+                                                    .suffix(" s"),
+                                            )
+                                            .on_hover_text(
+                                                "How long the menu/icon bars stay visible in\n\
+                                                 fullscreen after the mouse last moved.\n\
+                                                 0 = hide immediately (the slide-out animation\n\
+                                                 still plays).",
+                                            );
+                                        if hs.changed() {
+                                            self.save_settings();
+                                        }
+                                    });
+                                    let fm = ui.checkbox(
+                                        &mut self.fs_mask,
+                                        "Clean switch (hide window during the change)",
+                                    );
+                                    if fm.changed() {
+                                        self.save_settings();
+                                    }
+                                    fm.on_hover_text(
+                                        "Windows shows ghosting or a black flash while it resizes\n\
+                                         the window for fullscreen. With this on, lumo hides the\n\
+                                         window for the moment the switch takes, so the change\n\
+                                         looks like a clean blink. Uncheck if the keyboard seems\n\
+                                         unresponsive after a switch (clicking fixes focus).",
+                                    );
+                                    let df = ui.checkbox(
+                                        &mut self.dbl_fs,
+                                        "Double-click toggles fullscreen",
+                                    );
+                                    if df.changed() {
+                                        self.save_settings();
+                                    }
+                                    df.on_hover_text(
+                                        "On: double-clicking the image enters or leaves fullscreen.\n\
+                                         Off: double-clicking switches between fit and 100%.\n\
+                                         (Keys 0 / 1 still switch fit and 100% either way.)",
+                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.label("Hide mouse cursor after");
+                                        let hc = ui
+                                            .add(
+                                                egui::DragValue::new(&mut self.hide_cursor_secs)
+                                                    .speed(0.1)
+                                                    .range(0.0..=10.0)
+                                                    .suffix(" s"),
+                                            )
+                                            .on_hover_text(
+                                                "Fullscreen only: fade the mouse pointer away after\n\
+                                                 this many seconds without moving. 0 = keep visible.\n\
+                                                 Moving the mouse brings it (and the bars) back.",
+                                            );
+                                        if hc.changed() {
+                                            self.save_settings();
+                                        }
+                                    });
+                                });
+                                ui.collapsing("Slideshow", |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Advance every");
+                                        let ss = ui
+                                            .add(
+                                                egui::DragValue::new(&mut self.slide_secs)
+                                                    .speed(0.5)
+                                                    .range(0.5..=120.0)
+                                                    .suffix(" s"),
+                                            )
+                                            .on_hover_text(
+                                                "Time each page stays on screen in the slideshow.\n\
+                                                 Start/stop with S or the View menu.",
+                                            );
+                                        if ss.changed() {
+                                            self.save_settings();
+                                        }
+                                    });
+                                    let sl = ui.checkbox(&mut self.slide_loop, "Loop back to the start");
+                                    if sl.changed() {
+                                        self.save_settings();
+                                    }
+                                    sl.on_hover_text(
+                                        "On: the slideshow restarts from the first page after the\n\
+                                         last. Off: it stops at the end.",
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("S starts/stops · Esc stops").weak().size(11.0),
+                                    );
+                                });
+                                ui.collapsing("Look", |ui| {
+                                    let th = ui.checkbox(&mut self.theme_light, "Light theme");
+                                    if th.changed() {
+                                        self.save_settings();
+                                        ui.ctx().set_theme(if self.theme_light {
+                                            egui::ThemePreference::Light
+                                        } else {
+                                            egui::ThemePreference::Dark
+                                        });
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label("View background");
+                                        let mut col = Self::bg_color(self.view_bg);
+                                        let ce = ui.color_edit_button_srgba(&mut col);
+                                        if ce.changed() {
+                                            self.view_bg = ((col.r() as u32) << 16)
+                                                | ((col.g() as u32) << 8)
+                                                | (col.b() as u32);
+                                            self.save_settings();
+                                        }
+                                        ce.on_hover_text(
+                                            "The area around the image (page gaps and borders).",
+                                        );
+                                    });
+                                    let sm = ui.checkbox(
+                                        &mut self.smooth_scale,
+                                        "Smooth (antialiased) scaling",
+                                    );
+                                    if sm.changed() {
+                                        self.save_settings();
+                                    }
+                                    sm.on_hover_text(
+                                        "On: soft, smooth rendering.\n\
+                                         Off: pixelated 1:1 pixels — crisp for manga text at high zoom.",
+                                    );
+                                });
+                                ui.collapsing("Startup & files", |ui| {
+                                    let rw = ui.checkbox(
+                                        &mut self.remember_win,
+                                        "Remember window size and position",
+                                    );
+                                    if rw.changed() {
+                                        self.save_settings();
+                                    }
+                                    rw.on_hover_text(
+                                        "Saved when you close lumo; restored on the next launch.",
+                                    );
+                                    let sf = ui.checkbox(&mut self.start_fs, "Start in fullscreen");
+                                    if sf.changed() {
+                                        self.save_settings();
+                                    }
+                                    sf.on_hover_text("lumo opens in fullscreen next launch.");
+                                    let rl = ui.checkbox(
+                                        &mut self.reopen_last,
+                                        "Reopen last files at launch",
+                                    );
+                                    if rl.changed() {
+                                        self.save_settings();
+                                    }
+                                    rl.on_hover_text(
+                                        "When lumo is started without files, it reopens what you\n\
+                                         had open when you last closed it.",
+                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.label("JPEG save quality");
+                                        let jq = ui
+                                            .add(
+                                                egui::DragValue::new(&mut self.jpeg_q)
+                                                    .speed(1.0)
+                                                    .range(1.0..=100.0),
+                                            )
+                                            .on_hover_text(
+                                                "Quality used when saving .jpg/.jpeg files\n\
+                                                 (Save / Save As). 92 is a good default.",
+                                            );
+                                        if jq.changed() {
+                                            self.save_settings();
+                                        }
+                                    });
+                                    ui.label(egui::RichText::new("Sort opened files").weak().size(12.0));
+                                    let mut so = self.sort_mode.clamp(0, 4);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.radio_value(&mut so, 0, "Selection order");
+                                        ui.radio_value(&mut so, 1, "Name A→Z");
+                                        ui.radio_value(&mut so, 2, "Name Z→A");
+                                        ui.radio_value(&mut so, 3, "Newest");
+                                        ui.radio_value(&mut so, 4, "Oldest");
+                                    });
+                                    if so != self.sort_mode {
+                                        self.sort_mode = so;
+                                        self.save_settings();
+                                    }
+                                    ui.label(
+                                        egui::RichText::new("Applies to files opened after the change; name sorting is natural (img2 before img10).")
+                                            .weak()
+                                            .size(11.0),
+                                    );
+                                });
+                            });
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "lumo v{} — image viewer & comic reader",
+                                    env!("CARGO_PKG_VERSION")
+                                ))
                                 .weak()
                                 .size(12.0),
-                        );
-                        let zr = ui.add(
-                            egui::DragValue::new(&mut self.wheel_zoom_pct)
-                                .speed(0.5)
-                                .range(1.0..=80.0)
-                                .suffix("%"),
-                        )
-                        .on_hover_text(
-                            "How much one scroll-wheel notch zooms in/out. Drag sideways to change.",
-                        );
-                        if zr.changed() {
-                            self.save_settings();
-                        }
-                        let lm = ui.checkbox(&mut self.low_memory, "Low memory mode");
-                        if lm.changed() {
-                            self.save_settings();
-                        }
-                        lm.on_hover_text(
-                            "Keep only the page you are on and its immediate neighbours decoded.\n\
-                             Everything else is dropped as you leave it, so memory stays flat\n\
-                             no matter how long the queue is. Flipping back far re-decodes\n\
-                             (a brief spinner).",
-                        );
-                        ui.horizontal(|ui| {
-                            ui.label("Fullscreen: hide bars after");
-                            let hs = ui
-                                .add(
-                                    egui::DragValue::new(&mut self.chrome_hide_secs)
-                                        .speed(0.1)
-                                        .range(0.0..=10.0)
-                                        .suffix(" s"),
-                                )
-                                .on_hover_text(
-                                    "How long the menu/icon bars stay visible in fullscreen after\n\
-                                     the mouse last moved. 0 = hide immediately (the slide-out\n\
-                                     animation still plays).",
-                                );
-                            if hs.changed() {
-                                self.save_settings();
-                            }
+                            );
                         });
-                        let fm = ui.checkbox(
-                            &mut self.fs_mask,
-                            "Clean fullscreen switch (hide window during the change)",
-                        );
-                        if fm.changed() {
-                            self.save_settings();
-                        }
-                        fm.on_hover_text(
-                            "Windows shows ghosting or a black flash while it resizes the window\n\
-                             for fullscreen. With this on, lumo hides the window for the moment\n\
-                             the switch takes, so the change looks like a clean blink.\n\
-                             Uncheck if the keyboard seems unresponsive after a switch\n\
-                             (clicking the window fixes focus).",
-                        );
-                        let df = ui.checkbox(
-                            &mut self.dbl_fs,
-                            "Double-click on the image toggles fullscreen",
-                        );
-                        if df.changed() {
-                            self.save_settings();
-                        }
-                        df.on_hover_text(
-                            "On: double-clicking the image enters or leaves fullscreen.\n\
-                             Off: double-clicking switches between fit and 100%.\n\
-                             (Keys 0 / 1 still switch fit and 100% either way.)",
-                        );
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "lumo v{} — image viewer & comic reader",
-                                env!("CARGO_PKG_VERSION")
-                            ))
-                            .weak()
-                            .size(12.0),
-                        );
-                    });
                 });
 
                 info_left
@@ -1449,6 +1922,7 @@ impl Lumo {
             Action::Zoom100 => "100%  (1)",
             Action::Panel => "Adjust panel  (P)",
             Action::Fullscreen => "Fullscreen  (F11)",
+            Action::Slideshow => "Slideshow  (S)",
             Action::RotateL => "Rotate left  (Ctrl+L)",
             Action::RotateR => "Rotate right  (Ctrl+R)",
             Action::FlipH => "Flip horizontal  (Ctrl+H)",
@@ -1668,6 +2142,9 @@ impl Lumo {
         let resp = ui.allocate_rect(avail, egui::Sense::click_and_drag());
         let ctx = ui.ctx().clone();
 
+        // View background (configurable; also carries the theme).
+        ui.painter().rect_filled(avail, 0.0, Self::bg_color(self.view_bg));
+
         let prepared = self.prepare(&ctx);
         let mut repainted_hints = false;
         let _ = &mut repainted_hints;
@@ -1762,10 +2239,49 @@ impl Lumo {
                         })
                         .sum::<f32>()
                     });
-                    if wheel_lines.abs() > 0.01 {
+                    // Wheel = page turning (setting); Ctrl+wheel still zooms.
+                    // A "burst" = the frames while wheel events keep coming;
+                    // when a frame brings none, the burst ends and exactly
+                    // one page turn happens (one notch = one page, whether
+                    // the OS sends 1 or 2 raw events per notch). A long
+                    // touchpad gesture flips at most every ~8 lines.
+                    let ctrl = ctx.input(|i| i.modifiers.ctrl);
+                    if self.wheel_pages && !ctrl && !self.crop_mode {
+                        if wheel_lines.abs() > 0.01 {
+                            self.wheel_page_acc += wheel_lines;
+                            if self.wheel_page_acc.abs() >= 8.0 {
+                                let next = self.wheel_page_acc < 0.0;
+                                self.wheel_page_acc = 0.0;
+                                self.do_action(&ctx, if next { Action::Next } else { Action::Prev });
+                            }
+                        } else if self.wheel_page_acc != 0.0 {
+                            let next = self.wheel_page_acc < 0.0;
+                            self.wheel_page_acc = 0.0;
+                            self.do_action(&ctx, if next { Action::Next } else { Action::Prev });
+                        }
+                    } else if wheel_lines.abs() > 0.01 {
                         if let Some(p) = ctx.input(|i| i.pointer.hover_pos()) {
                             self.zoom_wheel(&ctx, wheel_lines, p);
                         }
+                    }
+                }
+
+                // ---- hold ↓/↑ to scroll steadily (autoscroll)
+                if self.autoscroll_speed > 0.01 && !self.crop_mode {
+                    let down = ctx.input(|i| i.key_down(Key::ArrowDown));
+                    let up = ctx.input(|i| i.key_down(Key::ArrowUp));
+                    if down || up {
+                        let dir: f32 = if down { 1.0 } else { -1.0 };
+                        let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.05);
+                        let v = self.autoscroll_speed.clamp(0.05, 5.0) * avail.size().y * dt;
+                        // In Fit mode the painted pan is zero by definition —
+                        // materialize the current fit scale so panning applies.
+                        if self.zoom == Zoom::Fit {
+                            self.zoom = Zoom::Scale(self.fit_scale(avail.size(), &ctx));
+                        }
+                        self.pan.y -= dir * v;
+                        self.zoom_anim = None;
+                        ctx.request_repaint();
                     }
                 }
 
@@ -2145,6 +2661,46 @@ impl Lumo {
     }
 }
 
+/// Natural-ish compare: runs of digits compare by value ("img2" < "img10").
+fn nat_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut ai, mut bi) = (0, 0);
+    let bytes = |s: &str, i: usize| s.as_bytes().get(i).copied().unwrap_or(0);
+    loop {
+        let ca = bytes(a, ai);
+        let cb = bytes(b, bi);
+        if ca == 0 && cb == 0 {
+            return std::cmp::Ordering::Equal;
+        }
+        if ca.is_ascii_digit() && cb.is_ascii_digit() {
+            // take the whole digit run on both sides
+            let a0 = ai;
+            let b0 = bi;
+            while bytes(a, ai).is_ascii_digit() {
+                ai += 1;
+            }
+            while bytes(b, bi).is_ascii_digit() {
+                bi += 1;
+            }
+            let na: u64 = a[a0..ai].parse().unwrap_or(u64::MAX);
+            let nb: u64 = b[b0..bi].parse().unwrap_or(u64::MAX);
+            if na != nb {
+                return na.cmp(&nb);
+            }
+        } else {
+            let la = a[ai..].chars().next().unwrap_or('\0');
+            let lb = b[bi..].chars().next().unwrap_or('\0');
+            let fla = la.to_ascii_lowercase();
+            let flb = lb.to_ascii_lowercase();
+            match fla.cmp(&flb) {
+                std::cmp::Ordering::Equal => {}
+                other => return other,
+            }
+            ai += la.len_utf8().max(1);
+            bi += lb.len_utf8().max(1);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Action {
     Next,
@@ -2173,16 +2729,89 @@ enum Action {
     CropCancel,
     Panel,
     Fullscreen,
+    Slideshow,
     Exit,
+}
+
+impl Lumo {
+    /// Capture the window rect and save settings + session once on close.
+    fn save_on_exit(&mut self, ctx: &egui::Context) {
+        if self.exit_saved {
+            return;
+        }
+        self.exit_saved = true;
+        if self.remember_win && !self.fullscreen {
+            let vp = ctx.input(|i| i.viewport().clone());
+            let rect = vp.inner_rect.or(vp.outer_rect);
+            if let Some(r) = rect {
+                if r.width() > 100.0 && r.height() > 100.0 {
+                    self.win_rect = Some(r);
+                }
+            }
+        }
+        self.save_settings();
+        if self.reopen_last {
+            self.save_last_session();
+        }
+    }
+
+    /// Slideshow: advance on the timer, wrap or stop at the end.
+    fn slideshow_tick(&mut self, ctx: &egui::Context) {
+        if !self.sliding || self.docs.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let secs = self.slide_secs.clamp(0.5, 120.0);
+        let due = self
+            .slide_next
+            .unwrap_or(now + std::time::Duration::from_secs_f32(secs));
+        if now >= due {
+            self.slide_next = Some(now + std::time::Duration::from_secs_f32(secs));
+            let last_doc = self.cur_doc + 1 >= self.docs.len();
+            let last_page = self.cur_page + 1 >= self.pages();
+            if last_doc && last_page && !self.slide_loop {
+                self.sliding = false;
+                self.slide_next = None;
+                self.flash = Some(("Slideshow ended".into(), Instant::now()));
+            } else {
+                self.next_page();
+            }
+        }
+        // egui sleeps while idle — wake it for the next slide.
+        if let Some(t) = self.slide_next {
+            let wait = (t - Instant::now()).as_secs_f32();
+            if wait > 0.0 {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f32(wait + 0.01));
+            }
+        }
+    }
 }
 
 impl eframe::App for Lumo {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // One-time startup: theme, remembered window, launch state.
+        if !self.startup_done {
+            self.startup_done = true;
+            ctx.set_theme(if self.theme_light {
+                egui::ThemePreference::Light
+            } else {
+                egui::ThemePreference::Dark
+            });
+            if self.start_fs && !self.fullscreen {
+                self.do_action(ctx, Action::Fullscreen);
+            }
+        }
+        // Persist window geometry and the open files when closing.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.save_on_exit(ctx);
+        }
+
         self.poll_worker();
         self.ensure_current();
         self.prefetch();
         self.trim_cache();
         self.clamp_to_monitor(ctx);
+        self.slideshow_tick(ctx);
 
         // expire old toasts while hidden
         if let Some((_, t)) = self.toast.clone() {
@@ -2191,7 +2820,6 @@ impl eframe::App for Lumo {
             }
         }
     }
-
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -2208,6 +2836,13 @@ impl eframe::App for Lumo {
                     std::time::Instant::now()
                         + std::time::Duration::from_secs_f32(self.chrome_hide_secs.max(0.0)),
                 );
+                // cursor stays visible while the bars are up
+                if self.hide_cursor_secs > 0.0 {
+                    self.cursor_until = Some(
+                        std::time::Instant::now()
+                            + std::time::Duration::from_secs_f32(self.hide_cursor_secs),
+                    );
+                }
             }
             // egui sleeps while idle; without this the expiry instant would
             // never be painted and the bars would stay on screen.
@@ -2217,13 +2852,33 @@ impl eframe::App for Lumo {
                     ctx.request_repaint_after(std::time::Duration::from_secs_f32(wait + 0.02));
                 }
             }
+            if self.hide_cursor_secs > 0.0 {
+                let cursor_due = self
+                    .cursor_until
+                    .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs_f32(self.hide_cursor_secs));
+                let wait = (cursor_due - std::time::Instant::now()).as_secs_f32();
+                if wait > 0.0 {
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f32(wait + 0.02));
+                }
+            }
         } else {
             self.chrome_until = None;
+            self.cursor_until = None;
         }
         let show_chrome = !self.fullscreen
             || self
                 .chrome_until
                 .is_some_and(|t| std::time::Instant::now() < t);
+        // Hide the mouse cursor after it has been idle in fullscreen a while.
+        if self.fullscreen
+            && self.hide_cursor_secs > 0.0
+            && !show_chrome
+            && self
+                .cursor_until
+                .is_some_and(|t| std::time::Instant::now() >= t)
+        {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
 
         // Drive the slide animation: full travel in 0.3 s.
         let target: f32 = if show_chrome { 1.0 } else { 0.0 };
@@ -2271,5 +2926,25 @@ impl eframe::App for Lumo {
         if self.pending.contains(&self.key()) || !self.adjust.is_neutral() {
             ctx.request_repaint();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nat_cmp;
+
+    #[test]
+    fn natural_order() {
+        let mut names = vec!["img10.png", "img2.png", "Img1.png", "img20.png", "img3.png"];
+        names.sort_by(|a, b| nat_cmp(a, b));
+        assert_eq!(names, vec!["Img1.png", "img2.png", "img3.png", "img10.png", "img20.png"]);
+    }
+
+    #[test]
+    fn natural_order_reversed() {
+        let mut names = vec!["page 2", "page 10", "page 1"];
+        names.sort_by(|a, b| nat_cmp(a, b));
+        names.reverse();
+        assert_eq!(names, vec!["page 10", "page 2", "page 1"]);
     }
 }

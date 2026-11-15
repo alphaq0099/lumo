@@ -5,7 +5,8 @@ use image::{DynamicImage, ImageFormat};
 use std::path::Path;
 
 /// Re-encode `image` and write it to `path`, honoring the extension.
-pub fn save_as(image: &DynamicImage, path: &Path) -> anyhow::Result<()> {
+/// `jpeg_q` is the JPEG quality (1-100).
+pub fn save_as(image: &DynamicImage, path: &Path, jpeg_q: u8) -> anyhow::Result<()> {
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
@@ -14,7 +15,7 @@ pub fn save_as(image: &DynamicImage, path: &Path) -> anyhow::Result<()> {
     let mut buf: Vec<u8> = Vec::new();
     match ext.as_str() {
         "jpg" | "jpeg" | "jfif" => {
-            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 92);
+            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, jpeg_q.clamp(1, 100));
             enc.encode_image(image).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         "png" | "apng" => image
@@ -66,6 +67,7 @@ pub fn overwrite(
     image: &DynamicImage,
     source_path: &Path,
     has_edits: bool,
+    jpeg_q: u8,
 ) -> anyhow::Result<()> {
     if !has_edits {
         anyhow::bail!("Nothing to save: this page has no edits.");
@@ -82,7 +84,7 @@ pub fn overwrite(
         }
     }
 
-    save_as(image, source_path)
+    save_as(image, source_path, jpeg_q)
 }
 
 fn backup_path(p: &Path) -> Option<std::path::PathBuf> {

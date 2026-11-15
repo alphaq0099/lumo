@@ -42,12 +42,23 @@ fn main() -> Result<(), eframe::Error> {
 
     let app = app::Lumo::new(docs);
 
+    // Restore the remembered window geometry BEFORE creating the window:
+    // commands sent after launch get fought by the viewport builder, which
+    // re-applies its own size every frame.
+    let remembered = app::Lumo::win_rect_from_conf();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_min_inner_size([420.0, 300.0])
+        .with_title("lumo")
+        .with_app_id("lumo");
+    viewport = match remembered {
+        Some((pos, size)) => viewport
+            .with_position(pos)
+            .with_inner_size(size),
+        None => viewport.with_inner_size([1100.0, 760.0]),
+    };
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 760.0])
-            .with_min_inner_size([420.0, 300.0])
-            .with_title("lumo")
-            .with_app_id("lumo"),
+        viewport,
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };

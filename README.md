@@ -41,6 +41,7 @@ frame (animation playback is on the roadmap).
 | `Ctrl`+`→` / Ctrl+`←` | previous / next file |
 | `Home` / `End` | first / last page of current file |
 | Mouse wheel | zoom (anchored at cursor), drag to pan |
+| `Mouse wheel` | zoom (anchored at cursor), drag to pan — *or* turn pages if you enable it in ⚙ (then `Ctrl`+wheel zooms) |
 | `0` / `1` | fit to window / 100% |
 | `+` / `-` (`=` / `-`) | zoom in / out |
 | `Ctrl`+`O` | open files (appended to the current selection) |
@@ -50,8 +51,10 @@ frame (animation playback is on the roadmap).
 | `B/W` button / `Ctrl`+`A` *panel* | grayscale, brightness/contrast/saturation panel, resize, sharpen |
 | `Ctrl`+`Z` | undo (per page edit stack) |
 | `Ctrl`+`S` | save — overwrites the original, keeps a one-time `.original.` backup |
-| `Ctrl`+`Shift`+`S` | save as (PNG/JPEG/WebP/TIFF/BMP/TGA/QOI/…, JPEG q92 / auto defaults) |
+| `Ctrl`+`Shift`+`S` | save as (PNG/JPEG/WebP/TIFF/BMP/TGA/QOI/…, JPEG quality is set in ⚙) |
 | `Ctrl`+`C` | copy image to clipboard |
+| `S` | slideshow — every page advances on a timer (interval and loop in ⚙); `S` or `Esc` stops |
+| hold `↓` / `↑` | autoscroll: the page scrolls steadily (speed in ⚙; great with fit-width) |
 | `F11` / `F` | fullscreen — image only: the bars hide and reappear for a moment when the mouse moves; `Esc` exits |
 
 The toolbar mirrors the common actions: prev/next, a view-mode button that
@@ -63,6 +66,33 @@ to pan.
 
 Pages extracted from archives/PDFs cannot be overwritten in place; `Ctrl+S`
 refuses and points at `Save As`.
+
+## Settings (⚙ in the top bar)
+
+Everything is saved to the config file (`%APPDATA%\lumo\lumo.conf` on Windows,
+`~/.config/lumo/lumo.conf` on Linux) and restored on the next launch.
+
+**Reading** — mouse wheel turns pages (one notch = one page, `Ctrl`+wheel
+still zooms) · zoom % per wheel notch · remember zoom between pages · fit
+mode (whole image / fit width / fit height — width/height suit tall comic
+pages) · autoscroll speed · low-memory mode · RAM cache size (32–2048 MB).
+
+**Fullscreen** — how long the bars stay up after the mouse moves · clean
+switch (hides the window for the resize moment, masks the Windows ghosting)
+· double-click toggles fullscreen · hide the mouse cursor after N idle
+seconds.
+
+**Slideshow** — advance every N seconds (0.5–120) · loop back to the start ·
+start/stop with `S` or the View menu, `Esc` stops.
+
+**Look** — light theme · view background color (the area around the image) ·
+smooth (antialiased) vs pixelated scaling (pixelated keeps manga text crisp
+at high zoom).
+
+**Startup & files** — remember window size and position · start in
+fullscreen · reopen the last files when launched without arguments · JPEG
+save quality (1–100) · sort order for opened files (selection order, name
+A→Z / Z→A natural so `img2` sorts before `img10`, newest or oldest first).
 
 ## PDF (and EPUB) notes
 
